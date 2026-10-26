@@ -1,0 +1,66 @@
+{
+ "format": 1,
+ "key": "2c648c8d748b91088d60936c86daa469f856257a0e9e79fd3730ce83856de25d",
+ "provider": "openai_compat",
+ "request": {
+  "json_schema": null,
+  "max_tokens": 2048,
+  "messages": [
+   {
+    "content": "Ты помощник. Для расчёта дат вызывай инструмент.",
+    "name": null,
+    "role": "system",
+    "tool_call_id": null,
+    "tool_calls": []
+   },
+   {
+    "content": "Какая дата будет через 45 дней после 2026-03-10?",
+    "name": null,
+    "role": "user",
+    "tool_call_id": null,
+    "tool_calls": []
+   }
+  ],
+  "tools": [
+   {
+    "description": "Посчитать дату: к дате start прибавить days дней. Арифметику дат делай только этим инструментом.",
+    "name": "date_calc",
+    "parameters": {
+     "properties": {
+      "days": {
+       "type": "integer"
+      },
+      "start": {
+       "description": "дата ГГГГ-ММ-ДД",
+       "type": "string"
+      }
+     },
+     "required": [
+      "start",
+      "days"
+     ],
+     "type": "object"
+    }
+   }
+  ]
+ },
+ "turn": {
+  "model": "qwen3:8b",
+  "stop_reason": "tool_calls",
+  "text": "",
+  "tool_calls": [
+   {
+    "args": {
+     "days": 45,
+     "start": "2026-03-10"
+    },
+    "id": "call_eao8lwck",
+    "name": "date_calc"
+   }
+  ],
+  "usage": {
+   "input_tokens": 225,
+   "output_tokens": 206
+  }
+ }
+}

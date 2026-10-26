@@ -1,0 +1,10 @@
+data
+reference
+.env
+.venv
+.git
+.claude
+**/__pycache__
+.pytest_cache
+.ruff_cache
+docs/screenshots

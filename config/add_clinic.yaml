@@ -1,0 +1,25 @@
+# Автомат добавления клиники (ТЗ п. 5.2.2, ADR 0004). Переходы — только по действию пользователя.
+# Ветку «бесплатно / платно» задаёт только ответ СК. «Закрыть» допустимо с любого шага.
+# Клиника «добавлена» только после ответа СК: insurer_free (бесплатно) или insurer_confirmed (платно, после
+# согласия HR и подтверждения СК). До этого черновик HR «клиника добавлена» не формируется (ревизия w3).
+version: 1
+initial: [alt_found, not_in_program, insufficient]
+transitions:
+  alt_found:        {close: closed}
+  insufficient:     {close: closed}
+  not_in_program:   {hr_wants_add: hr_wants_add, close: closed}
+  hr_wants_add:     {insurer_request_ready: awaiting_insurer, close: closed}
+  awaiting_insurer: {insurer_free: insurer_free, insurer_paid: insurer_paid, close: closed}
+  insurer_free:     {close: closed}
+  insurer_paid:     {hr_agreed: hr_agreed, hr_declined: hr_declined, close: closed}
+  hr_agreed:        {insurer_confirmed: insurer_confirmed, close: closed}
+  insurer_confirmed: {close: closed}
+  hr_declined:      {close: closed}
+drafts:
+  not_in_program: [hr_no_clinic]
+  hr_wants_add:   [insurer_add_request]
+  insurer_free:   [hr_clinic_added]
+  insurer_paid:   [hr_paid_terms]
+  hr_agreed:      [insurer_confirm_paid]          # клиника ещё не добавлена: ждём подтверждения СК
+  insurer_confirmed: [hr_clinic_added]
+idempotency_key: [request_id, clinic]

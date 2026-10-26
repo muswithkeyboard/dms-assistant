@@ -1,0 +1,32 @@
+# Тип документа по имени файла (план §3.1, docs/facts/kit/). Правила проверяются по порядку, первое совпадение
+# выигрывает. Имя сравнивается после NFC и casefold; pattern — регулярное выражение Python.
+# scope: contract — документ договора своей папки «Компания M»; group — общий для ГК (лежит в папке ГК или
+# помечен здесь как общий). Адаптер СК выбирается по содержимому документа, не по этим правилам.
+version: 1
+rules:
+  - pattern: 'лпу_регионы'
+    doc_type: catalog
+    scope: group
+    note: Каталог страховщика, ни один договор на него не ссылается — не условия договора (`docs/rules.md` п. 0а)
+  - pattern: 'правила страхования'
+    doc_type: rules
+    scope: group
+    note: Общие правила СК (ГК 1 — PDF в папке Компании 2, общий для группы), ниже договора по приоритету
+  - pattern: 'доп(\.|олнительное)\s*соглашение'
+    doc_type: amendment
+    scope: contract
+  - pattern: 'список медицинских организаций|перечень (клиник|лпу|медицинских)'
+    doc_type: clinics
+    scope: contract
+  - pattern: 'программ[аы] дмс'
+    doc_type: program
+    scope: contract
+  - pattern: 'памятка'
+    doc_type: memo
+    scope: contract
+  - pattern: '^договор'
+    doc_type: contract
+    scope: contract
+default:
+  doc_type: other
+  scope: contract

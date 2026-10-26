@@ -1,0 +1,61 @@
+[project]
+name = "dms-assistant"
+version = "0.1.0"
+description = "ИИ-ассистент менеджера сопровождения ДМС: проверяемые ответы по документам договора (прототип хакатона)"
+readme = "README.md"
+requires-python = ">=3.12"
+# Состав — строго docs/plan.md §12; новые зависимости — только по решению автора.
+dependencies = [
+    "starlette>=0.46",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "python-multipart>=0.0.20",
+    "pyyaml>=6.0",
+    "python-docx>=1.1",
+    "lxml>=5.3",
+    "openpyxl>=3.1",
+    "pdfplumber>=0.11",
+    "rapidfuzz>=3.10",
+    "pymorphy3>=2.0",
+    "pymorphy3-dicts-ru>=2.4",
+    "httpx>=0.27",
+    "anthropic>=0.40",
+    "openai>=1.50",
+    "gigachat>=0.1.35",
+    # Энкодер rubert-tiny2 в ONNX для маршрутизации вопросов (kNN): без torch, ~30 МБ модели
+    # (ADR 0009, решение пользователя 24.10.2026 — зависимость вне плана §12)
+    "onnxruntime>=1.19",
+    "tokenizers>=0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff", "playwright>=1.48", "matplotlib>=3.9"]
+
+[project.scripts]
+dms = "dms_core.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dms_api = ["templates/*.html", "static/*", "static/fonts/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+python_functions = ["test_*"]
+markers = [
+    "kit: нужен комплект организаторов в data/raw/ (иначе SKIP)",
+    "libreoffice: нужен soffice для сверки нумерации (иначе SKIP)",
+    "live_llm: нужен ключ модели в .env (иначе SKIP)",
+]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]

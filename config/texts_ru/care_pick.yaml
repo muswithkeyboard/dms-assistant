@@ -1,0 +1,8 @@
+# Выбор строки матрицы видов помощи под услугу вопроса (этап w12-care, config/service_classes.yaml): справка о
+# найденной строке другого способа оказания или другого класса услуг — без «входит» (care_in_program = not_found).
+# Подстановки: {care} — название строки матрицы, {program} — программа, {row_mode} / {question_mode} — способ
+# оказания (service_classes.yaml modes.*.name), {service_class} — класс услуги (service_classes.*.name).
+version: 1
+guided:
+  care_misfit_mode: 'В программе «{program}» найден вид помощи «{care}», но он про {row_mode}, а вопрос — про {question_mode} — эта строка матрицы не подтверждает, что услуга входит.'
+  care_misfit_class: 'В программе «{program}» найден вид помощи «{care}», но он не про {service_class} — эта строка матрицы не подтверждает, что услуга входит.'

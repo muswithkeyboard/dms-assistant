@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}{{ t.docs.title }} · {{ t.app_name }}{% endblock %}
+{% block scripts %}
+  <script src="/static/common.js?v={{ v }}" defer></script>
+  <script src="/static/documents.js?v={{ v }}" defer></script>
+  <script src="/static/clients.js?v={{ v }}" defer></script>
+{% endblock %}
+{% block main %}
+<div class="docs__top">
+  <h1 class="page-title">{{ t.docs.title }}</h1>
+</div>
+{# Вкладки страницы: документы комплекта и подключение клиента (ADR 0011). Переключение — static/clients.js,
+   выбранная вкладка — в адресе (#tab=clients). #}
+<div class="tabs docs__tabs" role="tablist" aria-label="{{ t.clients.tabs_aria }}">
+  <button type="button" role="tab" id="tab-docs" aria-controls="panel-docs" aria-selected="true" tabindex="0">{{ t.clients.tab_docs }}</button>
+  <button type="button" role="tab" id="tab-clients" aria-controls="panel-clients" aria-selected="false" tabindex="-1">{{ t.clients.tab_clients }}</button>
+</div>
+<section id="panel-docs" role="tabpanel" aria-labelledby="tab-docs" class="docs__panel">
+<div class="docs__bar">
+  <button class="btn" type="button" id="import-kit">{{ t.docs.import_kit }}</button>
+  <p class="hint" id="import-status" role="status"></p>
+</div>
+<div class="alert" id="alert" role="alert" hidden></div>
+<div class="layout2">
+  {# Дерево ГК → юрлица (договоры) → документы со статусами готовности ТЗ п. 7.1. #}
+  <aside class="panel" aria-labelledby="tree-h">
+    <h2 id="tree-h">{{ t.docs.tree_title }}</h2>
+    <div id="tree" class="tree" aria-busy="true"><p class="muted">{{ t.common.loading }}</p></div>
+  </aside>
+  <div class="docs__main">
+    <section class="panel" id="detail" aria-labelledby="detail-h" tabindex="-1">
+      <h2 id="detail-h">{{ t.docs.title }}</h2>
+      <div id="detail-body"><p class="muted">{{ t.docs.pick }}</p></div>
+    </section>
+    <section class="panel" aria-labelledby="up-h">
+      <h2 id="up-h">{{ t.docs.upload_title }}</h2>
+      <form id="upload-form" class="upload" novalidate>
+        {# Своя подпись кнопки выбора файла (у системной — язык браузера): input скрыт, кнопка его открывает. #}
+        <div class="f">
+          <label for="up-file" id="up-file-l">{{ t.docs.upload_file }}</label>
+          <input class="vh" type="file" id="up-file" name="file" accept=".docx,.xlsx,.pdf,.txt" required tabindex="-1">
+          <div class="filepick">
+            <button class="btn btn--small" type="button" id="up-pick" aria-describedby="up-file-name" aria-labelledby="up-pick up-file-l">{{ t.docs.upload_pick }}</button>
+            <span class="filepick__name" id="up-file-name" aria-live="polite">{{ t.docs.upload_no_file }}</span>
+          </div>
+        </div>
+        <div class="f2">
+          <div class="f">
+            <label for="up-group">{{ t.docs.upload_group }}</label>
+            <select id="up-group" name="group_id"></select>
+          </div>
+          <div class="f">
+            <label for="up-contract">{{ t.docs.upload_contract }}</label>
+            <select id="up-contract" name="contract_id"></select>
+          </div>
+        </div>
+        <div class="f2">
+          <div class="f">
+            <label for="up-type">{{ t.docs.upload_type }}</label>
+            <select id="up-type" name="doc_type">
+              <option value="">{{ t.docs.upload_type_auto }}</option>
+              {% for key, label in t.doc_types.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="f">
+            <label for="up-by">{{ t.docs.upload_by }}</label>
+            <input type="text" id="up-by" name="uploaded_by" value="{{ t.docs.upload_by_default }}" maxlength="80">
+          </div>
+        </div>
+        <p class="alert" id="up-alert" role="alert" hidden></p>
+        <p class="hint" id="up-status" role="status"></p>
+        <button class="btn btn--primary" type="submit" id="up-send">{{ t.docs.upload_send }}</button>
+      </form>
+    </section>
+  </div>
+</div>
+</section>
+{% include "_clients.html" %}
+{% endblock %}

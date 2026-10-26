@@ -1,0 +1,17 @@
+# Документы организаторов, рабочие данные, секреты.
+# data и reference — ссылки на ../data и ../reference (материалы вне репозитория, ADR 0007)
+/data
+/reference
+data/raw/
+data/app/
+data/derived/
+.env
+# Python / инструменты
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# Системное
+.DS_Store
+*.egg-info/

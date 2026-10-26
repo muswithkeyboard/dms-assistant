@@ -1,0 +1,59 @@
+# Шаблоны черновиков (ADR 0004, план §6.9). Подставляются только поля {..}; неизвестные — «[ЗАПОЛНИТЬ]».
+# Без ПДн, диагнозов, сроков, согласований и обещаний покрытия. Фильтр config/forbidden_promises.yaml — тест на
+# каждом шаблоне (tests/scenarios/test_drafts.py) и страховка на итоговом тексте (drafts.render).
+# Поля (scenarios/drafts.py draft_fields): legal_entity, contract («№ …»), program («…»), clinic, care_type, address,
+# alternatives (список «— клиника, адрес, франшиза»), insurer_terms (цитата ответа СК).
+# hr_clinic_added — только на шагах insurer_free и insurer_confirmed (после подтверждения СК, ревизия w3).
+# Значение поля с обещанием (сроки, «гарантия», «будет добавлена») не подставляется: «[ЗАПОЛНИТЬ]» и пометка
+# history.promise_fields; ответ СК остаётся в history как источник.
+version: 1
+templates:
+  hr_no_clinic:
+    to: hr
+    subject: 'Клиника {clinic} в программе {program}'
+    body: |
+      Добрый день!
+
+      По договору {contract} ({legal_entity}) клиника {clinic} не входит в программу {program} для обращения «{care_type}».
+      В программе есть клиники, где можно получить эту помощь:
+      {alternatives}
+
+      Если сотруднику важна именно эта клиника, мы можем запросить у страховой компании её добавление в программу.
+      Сообщите, пожалуйста, нужно ли это сделать.
+  insurer_add_request:
+    to: insurer
+    subject: 'Запрос о добавлении клиники {clinic} в программу {program}'
+    body: |
+      Добрый день!
+
+      Просим рассмотреть возможность добавления клиники {clinic} ({address}) в программу {program}
+      по договору {contract} ({legal_entity}) для обращения «{care_type}».
+      Просим сообщить, возможно ли добавление и на каких условиях.
+  hr_clinic_added:
+    to: hr
+    subject: 'Клиника {clinic} добавлена в программу {program}'
+    body: |
+      Добрый день!
+
+      Страховая компания подтвердила: клиника {clinic} добавлена в программу {program} по договору {contract}
+      ({legal_entity}) для обращения «{care_type}».
+  hr_paid_terms:
+    to: hr
+    subject: 'Условия добавления клиники {clinic}'
+    body: |
+      Добрый день!
+
+      По договору {contract} ({legal_entity}) страховая компания ответила на запрос о добавлении клиники {clinic}
+      в программу {program} для обращения «{care_type}». Условия из ответа страховой компании:
+      {insurer_terms}
+
+      Сообщите, пожалуйста, согласны ли вы с этими условиями.
+  insurer_confirm_paid:
+    to: insurer
+    subject: 'Подтверждение условий добавления клиники {clinic}'
+    body: |
+      Добрый день!
+
+      Клиент согласен с условиями добавления клиники {clinic} в программу {program} по договору {contract}
+      ({legal_entity}) для обращения «{care_type}».
+      Просим подтвердить добавление.

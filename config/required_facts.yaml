@@ -1,0 +1,20 @@
+# Обязательные факты по сценарию (план §6.6–6.8). Нет факта → вопрос (`docs/rules.md` п. 2).
+# blocking: true (по умолчанию) — без факта вывода нет: вместо ответа задаётся уточняющий вопрос.
+# blocking: false — вывод возможен и без факта (часть проверок пропускается): ответ даётся, а недостающее
+# показывается в «что неизвестно» с этим вопросом (решение пользователя 24.10.2026: уточнять, только когда без
+# факта нет вывода). Контекст ГК не блокирует: ответ — отдельным блоком по каждому договору (ADR 0005).
+version: 3
+sc01:
+  - {slot: service, question: 'Какая услуга или вид обращения? (например, МРТ, приём стоматолога)', when: clinic_unknown}
+  - {slot: service, question: 'Какая услуга или вид обращения? (без неё проверена только клиника)', when: clinic_known, blocking: false}
+  - {slot: program, question: 'Какая программа у застрахованного?', when: program_affects_answer}
+  - {slot: clinic, question: 'В какой клинике отказали? (без неё не проверена клиника и альтернативы)', when: refusal_mentioned, blocking: false}
+  - {slot: contract, question: 'Какое юрлицо / договор у застрахованного?', when: context_is_group, blocking: false}
+sc02_clinic:
+  - {slot: care_type, question: 'Какой вид помощи нужен?'}
+  - {slot: program, question: 'Какая программа у застрахованного?', when: program_affects_answer}
+  - {slot: city, question: 'В каком городе или районе нужна клиника?', blocking: false}
+sc02_add_clinic:
+  - {slot: clinic, question: 'Какую клинику нужно добавить?'}
+  - {slot: program, question: 'В какую программу?', when: program_affects_answer}
+  - {slot: care_type, question: 'Для какого вида обращения?', blocking: false}

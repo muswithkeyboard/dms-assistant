@@ -1,0 +1,24 @@
+{# Вкладка «Подключение клиента» (ADR 0011, CONTRACTS §9): слева — подключённые клиенты (GET /api/clients),
+   справа — мастер «Новый клиент» или карточка группы: файлы по договорам, обработка, отчёт о готовности.
+   Содержимое рисует static/clients.js; здесь — каркас, диалог подтверждения удаления и область объявлений. #}
+<section id="panel-clients" role="tabpanel" aria-labelledby="tab-clients" class="docs__panel" hidden>
+  <div class="layout2">
+    <aside class="panel" aria-labelledby="cl-list-h">
+      <div class="cl-side__head">
+        <h2 id="cl-list-h">{{ t.clients.list_title }}</h2>
+        <button class="btn btn--primary btn--small" type="button" id="cl-new">+ {{ t.clients.new_client }}</button>
+      </div>
+      <ul id="cl-list" class="navlist cl-list" aria-busy="true"><li class="muted">{{ t.common.loading }}</li></ul>
+    </aside>
+    <div class="panel cl-main" id="cl-main" aria-labelledby="tab-clients"><p class="muted">{{ t.clients.pick }}</p></div>
+  </div>
+  <p class="vh" id="cl-live" role="status" aria-live="polite"></p>
+</section>
+<dialog class="dlg" id="cl-del-dlg" aria-labelledby="cl-del-h" aria-describedby="cl-del-text">
+  <h2 id="cl-del-h">{{ t.clients.delete_title }}</h2>
+  <p id="cl-del-text"></p>
+  <div class="dlg__actions">
+    <button class="btn" type="button" id="cl-del-cancel">{{ t.common.cancel }}</button>
+    <button class="btn btn--danger" type="button" id="cl-del-ok">{{ t.clients.delete_confirm }}</button>
+  </div>
+</dialog>

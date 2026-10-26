@@ -1,0 +1,55 @@
+# Метки SC 01 (ТЗ п. 5.1, план §6.6). Правила применяются сверху вниз; первое сработавшее задаёт метку.
+# Входы — результаты проверок движка (yes / absent / not_found / conditional / contradictory).
+# «not_found» никогда не даёт «нельзя» (`docs/rules.md` п. 3а).
+version: 1
+rules:
+  - id: excluded
+    when: {exclusion: yes}
+    label: denied
+  - id: care_absent
+    when: {care_in_program: absent}
+    label: denied
+  # По тексту вопроса клиника не угадывается (ревизии 4–5: «Medsi» → ложное «нет в перечне»). «Нет в перечне» —
+  # только после выбора менеджера «нет в перечне программы» (ADR 0010, clinic_confirmed передаёт движок).
+  - id: clinic_absent
+    when: {clinic_in_program: absent, clinic_confirmed: yes}
+    label: denied
+  - id: contradiction
+    when: {documents: contradictory}
+    label: conditional
+    note: нужно подтверждение СК
+  # Клиника названа, но в перечне не подтверждена (не нашли / «нет в перечне» без выбора / выбрана строка другого
+  # вида помощи): «при условиях» вводило бы в заблуждение — сначала выбор клиники (ревизия 6, ADR 0010).
+  - id: clinic_unresolved
+    when: {care_in_program: yes, clinic_named: yes, clinic_confirmed: no, clinic_in_program: [absent, not_found]}
+    label: insufficient
+    note: выберите клинику из перечня
+  - id: conditions
+    when: {care_in_program: yes, conditions: present}
+    label: conditional
+  # По тексту вопроса — не включать (ревизия 5: 6 ложных «можно», чужая клиника принята за названную). «Можно» —
+  # только когда строку перечня выбрал менеджер (ADR 0010): личность клиники подтверждает человек, а не разбор.
+  - id: covered
+    when: {care_in_program: yes, clinic_in_program: yes, conditions: none, clinic_confirmed: yes}
+    label: allowed
+  # ОТКЛЮЧЕНО 24.10.2026 по ревизии w5-coverage: 11 ложных «можно»; после исправлений повторная ревизия на новом
+  # наборе (260 вопросов) — с правилом 6 ложных «можно», без правила 0. Не включать без новой ревизии.
+  # # «Положено ли …» без отказа и без названной клиники: услуга входит, исключения просмотрены, условий нет →
+  # # «можно» по программе (клиника не проверялась — это в «что неизвестно»). При отказе клиники правило не
+  # # срабатывает: без проверки клиники «можно» было бы ложным обещанием (решение автора 24.10.2026).
+  # - id: covered_by_program
+  #   when: {care_in_program: yes, exclusion: absent, clinic_in_program: null, conditions: none, refusal: no}
+  #   label: allowed
+  #   note: по программе; клиника не проверялась
+  - id: unknown
+    when: {}
+    label: insufficient
+notes:
+  denied_with_alternative: есть альтернатива       # «нельзя (есть альтернатива)», если clinics_pick нашёл
+  franchise_writeoff_ok: списание правомерно
+# «Нет в документах» (absent) допустимо, только если разобран хотя бы один документ этих типов
+# и в looked_at перечислено просмотренное (`docs/rules.md` п. 3а); иначе absent → not_found.
+absent_sources:
+  exclusion: [program, contract, amendment]
+  care_in_program: [program, contract, amendment]
+  clinic_in_program: [clinics, contract, program]

@@ -1,0 +1,48 @@
+# Ассистент ДМС. Запуск: docker compose up --build → http://127.0.0.1:8080
+# Комплект организаторов — только для чтения из ${DMS_RAW_DIR:-../data/raw} (ADR 0007: данные вне репозитория).
+# Проверка: docker compose run --rm verify
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  app:
+    build: {context: ., target: app}
+    image: dms-assistant:0.1.0
+    ports:
+      - "${DMS_PUBLISH:-127.0.0.1:8080}:8080"   # наружу — только по решению пользователя (`docs/rules.md` п. 15)
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DMS_HOST: 0.0.0.0
+      DMS_DATA_DIR: /data
+      DMS_TRUSTED_PROXIES: "${DMS_TRUSTED_PROXIES:-}"
+    volumes:
+      - "${DMS_RAW_DIR:-../data/raw}:/data/raw:ro"
+      # энкодер rubert-tiny2 (ONNX, scripts/export_encoder.py); нет папки — маршрутизация на правилах (ADR 0009)
+      - "${DMS_MODELS_DIR:-../data/models}:/data/models:ro"
+      - dms-derived:/data/derived
+      - dms-app:/data/app
+    <<: *hardening
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    mem_limit: "${DMS_MEM_LIMIT:-2g}"      # сервер 2–4 ГБ (ADR 0009): по умолчанию проверяем на нижней границе
+    pids_limit: 256
+    restart: unless-stopped
+
+  verify:
+    profiles: ["tools"]
+    build: {context: ., target: verify}
+    image: dms-assistant-verify:0.1.0
+    environment:
+      DMS_DATA_DIR: /data
+    volumes:
+      - "${DMS_RAW_DIR:-../data/raw}:/data/raw:ro"
+    <<: *hardening
+    tmpfs: ["/tmp:size=512m,mode=1777", "/data/derived:size=1g,uid=10001", "/data/app:size=64m,uid=10001"]
+    pids_limit: 512
+
+volumes:
+  dms-derived:
+  dms-app:

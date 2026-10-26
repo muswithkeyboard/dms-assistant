@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block scripts %}
+  <script src="/static/common.js?v={{ v }}" defer></script>
+  <script src="/static/chat.js?v={{ v }}" defer></script>
+{% endblock %}
+{% block main_class %} main--chat{% endblock %}
+{% block main %}
+<h1 class="vh">{{ t.nav.chat }}</h1>
+<div class="chatlay" id="chatlay">
+  {# Левая колонка: «Новый чат», чаты (название + договор серым), обращения — только если их больше одного
+     (или включён показ закрытых). На узком экране колонка выезжает слева по кнопке «Чаты». #}
+  <aside class="panel side" id="side" aria-label="{{ t.chat.chats_title }}" tabindex="-1">
+    <button class="btn btn--primary side__new" type="button" id="new-chat-btn" aria-haspopup="dialog">+ {{ t.chat.new_chat }}</button>
+    <h2 class="side__h" id="chats-h">{{ t.chat.chats_title }}</h2>
+    <ul class="navlist navlist--compact" id="chat-list" aria-labelledby="chats-h" aria-busy="true"></ul>
+    <section class="side__req" id="req-box" aria-labelledby="req-h" hidden>
+      <div class="side__head">
+        <h2 class="side__h" id="req-h">{{ t.chat.requests_short }}</h2>
+        <button class="btn btn--small btn--link" type="button" id="new-req-btn" disabled>+ {{ t.chat.menu_new }}</button>
+      </div>
+      <ul class="navlist navlist--compact" id="req-list" aria-labelledby="req-h"></ul>
+      <label class="check"><input type="checkbox" id="show-closed"> <span>{{ t.chat.show_closed }}</span></label>
+    </section>
+  </aside>
+  <div class="side-backdrop" id="side-backdrop" aria-hidden="true"></div>
+
+  {# Центр — чат: шапка одной строкой («Договор № N · программа») и меню «⋯», лента сообщений, поле ввода внизу. #}
+  <section class="panel chat" aria-labelledby="chat-h">
+    <header class="chat__head">
+      <button class="btn btn--small chat__chats" type="button" id="side-toggle" aria-controls="side" aria-expanded="false">☰ {{ t.chat.chats_toggle }}</button>
+      <h2 id="chat-h" class="chat__title">{{ t.chat.intro_title }}</h2>
+      <div class="menu" id="chat-menu-box" hidden>
+        <button class="btn btn--small menu__btn" type="button" id="chat-menu-btn" aria-haspopup="true" aria-expanded="false" aria-controls="chat-menu" aria-label="{{ t.chat.menu }}" title="{{ t.chat.menu }}">⋯</button>
+        <ul class="menu__list" id="chat-menu" hidden></ul>
+      </div>
+    </header>
+    <div class="alert" id="alert" role="alert" hidden></div>
+    <div class="messages" id="messages" role="log" aria-label="{{ t.nav.chat }}" tabindex="-1">
+      <p class="muted" id="chat-empty">{{ t.chat.pick_chat }}</p>
+    </div>
+    <p class="vh" id="announce" role="status" aria-live="polite"></p>
+    <div id="request-tools"></div>
+    <form class="ask" id="ask-form" novalidate>
+      <div class="examples" id="examples" hidden>
+        <p class="hint">{{ t.chat.examples_hint }}</p>
+        <ol class="examples__grid" id="examples-list" aria-label="{{ t.chat.examples_btn }}"></ol>
+      </div>
+      <div class="ask__bar">
+        <button class="btn btn--small btn--link" type="button" id="examples-btn" aria-expanded="false" aria-controls="examples">{{ t.chat.examples_btn }} <span class="fold__n" id="examples-n"></span></button>
+      </div>
+      <label class="vh" for="question">{{ t.chat.question_label }}</label>
+      <div class="ask__row">
+        <textarea id="question" rows="1" maxlength="4000" placeholder="{{ t.chat.question_placeholder }}" aria-describedby="ask-hint" disabled></textarea>
+        <button class="btn btn--primary" type="submit" id="ask-btn" disabled>{{ t.chat.send }}</button>
+      </div>
+      <p class="hint ask__hint" id="ask-hint">{{ t.chat.ask_hint }}</p>
+    </form>
+  </section>
+
+  {# Источник по сноске [n]: шторка справа (документ → пункт → цитата с подсветкой). По умолчанию скрыта, Esc — закрыть. #}
+  <aside class="panel sources" id="sources" aria-labelledby="src-h" tabindex="-1">
+    <div class="side__head">
+      <h2 id="src-h">{{ t.sources.title }}</h2>
+      <button class="btn btn--small sources__close" type="button" id="sources-close">{{ t.sources.close }}</button>
+    </div>
+    <div id="sources-body"><p class="muted">{{ t.sources.empty }}</p></div>
+  </aside>
+  <div class="sources-backdrop" id="sources-backdrop" aria-hidden="true"></div>
+</div>
+
+<dialog class="dlg" id="new-chat-dlg" aria-labelledby="nc-h">
+  <form id="new-chat-form" method="dialog" novalidate>
+    <h2 id="nc-h">{{ t.new_chat.title }}</h2>
+    <p class="hint">{{ t.new_chat.intro }}</p>
+    <fieldset class="seg">
+      <legend>{{ t.new_chat.kind_legend }}</legend>
+      <div class="seg__row">
+        <label><input type="radio" name="nc-kind" value="group" checked><span>{{ t.new_chat.kind_group }}</span></label>
+        <label><input type="radio" name="nc-kind" value="contract"><span>{{ t.new_chat.kind_contract }}</span></label>
+      </div>
+    </fieldset>
+    <div class="f" id="nc-group-box">
+      <label for="nc-group">{{ t.new_chat.group }}</label>
+      <select id="nc-group"></select>
+    </div>
+    <div class="f" id="nc-contract-box" hidden>
+      <label for="nc-search">{{ t.new_chat.contract_search }}</label>
+      <input type="search" id="nc-search" placeholder="{{ t.new_chat.contract_search_placeholder }}" autocomplete="off" aria-controls="nc-contract">
+      <label class="vh" for="nc-contract">{{ t.new_chat.contract_list }}</label>
+      <select id="nc-contract" size="6"></select>
+      <p class="hint" id="nc-contract-none" hidden>{{ t.new_chat.contract_none }}</p>
+    </div>
+    <div class="f2">
+      <div class="f">
+        <label for="nc-program">{{ t.new_chat.program }}</label>
+        <input type="text" id="nc-program" list="nc-programs" placeholder="{{ t.new_chat.program_placeholder }}" autocomplete="off">
+        <datalist id="nc-programs"></datalist>
+      </div>
+      <div class="f">
+        <label for="nc-date">{{ t.new_chat.date }}</label>
+        <input type="date" id="nc-date">
+      </div>
+    </div>
+    <div class="f">
+      <label for="nc-title">{{ t.new_chat.title_field }}</label>
+      <input type="text" id="nc-title" maxlength="120" autocomplete="off">
+    </div>
+    <p class="alert" id="nc-alert" role="alert" hidden></p>
+    <div class="dlg__actions">
+      <button class="btn" type="button" id="nc-cancel">{{ t.common.cancel }}</button>
+      <button class="btn btn--primary" type="submit" id="nc-create">{{ t.new_chat.create }}</button>
+    </div>
+  </form>
+</dialog>
+{% endblock %}
