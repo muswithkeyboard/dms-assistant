@@ -15,7 +15,6 @@
 """
 from __future__ import annotations
 
-import contextvars
 import ipaddress
 import json
 import logging
@@ -105,14 +104,6 @@ class RateLimiter:
                 return max(1, int(self.window - (now - q[0])) + 1)
             q.append(now)
             return None
-
-    def release(self, client: str) -> None:
-        """Вернуть последнюю учтённую попытку: действие не состоялось (например, регистрация не прошла проверку
-        полей или логин занят) — в лимит «успешных» действий она не идёт."""
-        with self._lock:
-            q = self._hits.get(client)
-            if q:
-                q.pop()
 
     def _purge(self, now: float) -> None:
         """Под наплывом новых адресов: сначала удаляются ключи без отметок в окне (устаревшие). Если и так места
@@ -295,9 +286,6 @@ HEAVY_PER_CLIENT = 1          # тяжёлых расчётов одноврем
 CLIENT_WAIT_SECONDS = 6.0     # сколько второй запрос того же адреса ждёт, пока закончится его первый
 BUSY_RETRY_AFTER = 5
 
-# Адрес клиента текущего запроса (ставит обёртка маршрутов app.py): HeavyGate.slot() без аргумента берёт его
-# отсюда — так один слот на адрес действует и для вложенных вызовов slot().
-current_client: contextvars.ContextVar[str | None] = contextvars.ContextVar("dms_client", default=None)
 
 
 def _busy(own: bool = False) -> ServiceError:
@@ -360,8 +348,8 @@ class HeavyGate:
 
     @contextmanager
     def slot(self, client: str | None = None) -> Iterator[None]:
-        """Без ожидания. client=None — адрес текущего запроса (current_client); вне запроса — без учёта адреса."""
-        client = client if client is not None else current_client.get()
+        """Без ожидания. client — адрес клиента (security.request_client) или имя фоновой задачи; None — без учёта
+        адреса. Все вызовы передают адрес явно (ревью 29.10.2026 п. 24: неявный адрес из contextvar не ставился)."""
         if not self._take_client(client):
             raise _busy(own=True)
         self._take_slot(client)
@@ -373,7 +361,6 @@ class HeavyGate:
     @asynccontextmanager
     async def aslot(self, client: str | None = None) -> AsyncIterator[None]:
         """То же, но второй запрос того же адреса ждёт (не дольше client_wait), пока закончится первый."""
-        client = client if client is not None else current_client.get()
         deadline = time.monotonic() + self.client_wait
         while not self._take_client(client):
             if time.monotonic() >= deadline:
@@ -389,7 +376,6 @@ class HeavyGate:
         """Слот, который освобождает тот, кто закончил расчёт (поток), а не обработчик запроса: обрыв соединения
         клиента не освобождает слот раньше конца расчёта — предел одновременных расчётов не превышается.
         Ожидание адреса — как у aslot; возвращает функцию освобождения (вызвать ровно один раз)."""
-        client = client if client is not None else current_client.get()
         deadline = time.monotonic() + self.client_wait
         while not self._take_client(client):
             if time.monotonic() >= deadline:
@@ -431,6 +417,124 @@ async def read_body(request, limit: int) -> bytes:
 
 def _human(n: int) -> str:
     return f"{n // (1024 * 1024)} МБ" if n >= 1024 * 1024 else f"{max(1, n // 1024)} КБ"
+
+
+# --------------------------------------------------------------------------------------------
+# Host, Origin и Content-Type: защита от DNS-rebinding и CSRF (ревизия w16-sec)
+# --------------------------------------------------------------------------------------------
+# Сервис без входа по паролю: любой сайт, открытый у менеджера в браузере, мог бы слать POST на 127.0.0.1:8080
+# (простой запрос text/plain без preflight) или, подменив DNS своего имени на 127.0.0.1, читать ответы API.
+#   * Host — только 127.0.0.1, localhost, [::1] и имена из DMS_ALLOWED_HOSTS (через запятую, без порта);
+#     иначе 403 на любой путь (за доверенным прокси Host берётся из X-Forwarded-Host — ProxyHeadersMiddleware);
+#   * небезопасный метод на /api/*: Sec-Fetch-Site: cross-site — 403; Origin есть и не совпадает с Host — 403
+#     (Origin «null» — тоже 403);
+#   * тело JSON-маршрутов — только с Content-Type application/json (app.json_body, 415); пустое тело без
+#     Content-Type допустимо (кнопки «Закрыть», «Обработать» шлют POST без тела; его защищает проверка Origin).
+LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+ERR_HOST = "Адрес сайта не разрешён: откройте ассистента по адресу 127.0.0.1 или localhost, либо добавьте имя " \
+           "сервера в DMS_ALLOWED_HOSTS."
+ERR_ORIGIN = "Запрос со стороннего сайта отклонён: действия выполняются только со страниц самого ассистента."
+ERR_CONTENT_TYPE = "Тело запроса должно быть JSON: укажите заголовок Content-Type: application/json."
+
+
+def parse_allowed_hosts(value: str | Iterable[str] | None) -> frozenset[str]:
+    """DMS_ALLOWED_HOSTS → множество имён в нижнем регистре (порт и пробелы отбрасываются) вместе с LOCAL_HOSTS."""
+    items = value.split(",") if isinstance(value, str) else list(value or ())
+    out = set(LOCAL_HOSTS)
+    for raw in items:
+        h = _host_name(raw.strip())
+        if h:
+            out.add(h)
+    return frozenset(out)
+
+
+def allowed_hosts_from_env() -> frozenset[str]:
+    """DMS_ALLOWED_HOSTS из окружения или `.env` (как Settings: префикс DMS_)."""
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    class _Hosts(BaseSettings):
+        model_config = SettingsConfigDict(env_prefix="DMS_", env_file=".env", extra="ignore")
+        allowed_hosts: str = ""
+
+    return parse_allowed_hosts(_Hosts().allowed_hosts)
+
+
+def _host_name(value: str) -> str:
+    """«Example.ORG:8080» → «example.org»; «[::1]:8080» → «[::1]»; мусор → ""."""
+    value = value.strip().lower()
+    if not value or not _HOST_RE.fullmatch(value):
+        return ""
+    if value.startswith("["):
+        return value[:value.index("]") + 1]
+    return value.rsplit(":", 1)[0] if ":" in value else value
+
+
+_DEFAULT_PORTS = {"http": "80", "https": "443"}
+
+
+def _netloc(host: str, scheme: str) -> str:
+    """Имя и порт для сравнения Origin с Host: порт по умолчанию схемы отбрасывается."""
+    host = host.strip().lower()
+    port = _DEFAULT_PORTS.get(scheme)
+    if port and host.endswith(":" + port) and not host.endswith("]"):
+        host = host[: -len(port) - 1]
+    return host
+
+
+def origin_matches(origin: str, host: str, scheme: str) -> bool:
+    """Origin («scheme://host[:port]») указывает на тот же сайт, что Host запроса (с учётом порта по умолчанию)."""
+    m = re.fullmatch(r"(https?)://([^/?#]+)", origin.strip(), flags=re.IGNORECASE)
+    if not m:
+        return False
+    o_scheme = m.group(1).lower()
+    return _netloc(m.group(2), o_scheme) == _netloc(host, scheme if scheme in _DEFAULT_PORTS else o_scheme)
+
+
+def is_json_content_type(value: str | None) -> bool:
+    """application/json (с параметрами вроде charset) — да; text/plain, form и прочее — нет."""
+    return (value or "").split(";", 1)[0].strip().lower() == "application/json"
+
+
+class RequestGuardMiddleware:
+    """Проверка Host (все пути) и Origin / Sec-Fetch-Site (небезопасные методы /api/*), см. блок выше.
+    Ошибка /api/* — JSON {"error": {code, message, field}} как у остальных маршрутов; страницы — простой текст."""
+
+    def __init__(self, app, allowed_hosts: Iterable[str] = LOCAL_HOSTS):
+        self.app = app
+        self.allowed = frozenset(_host_name(h) or h for h in allowed_hosts) | LOCAL_HOSTS
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers: dict[bytes, str] = {}
+        for k, v in scope.get("headers", []):
+            headers.setdefault(k.lower(), v.decode("latin-1"))
+        host = headers.get(b"host", "")
+        path = scope.get("path", "")
+        api = path.startswith("/api/")
+        if _host_name(host) not in self.allowed:
+            await self._deny(send, api, "host_not_allowed", ERR_HOST)
+            return
+        if api and scope.get("method", "") in UNSAFE_METHODS:
+            site = headers.get(b"sec-fetch-site", "").strip().lower()
+            origin = headers.get(b"origin")
+            if site == "cross-site" or (origin is not None
+                                        and not origin_matches(origin, host, scope.get("scheme", "http"))):
+                await self._deny(send, api, "cross_origin", ERR_ORIGIN)
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _deny(send, api: bool, code: str, message: str) -> None:
+        if api:
+            body = json.dumps({"error": {"code": code, "message": message, "field": None}},
+                              ensure_ascii=False).encode()
+            ctype = b"application/json"
+        else:
+            body, ctype = message.encode(), b"text/plain; charset=utf-8"
+        await _send_plain(send, 403, body, [(b"content-type", ctype)])
 
 
 # --------------------------------------------------------------------------------------------

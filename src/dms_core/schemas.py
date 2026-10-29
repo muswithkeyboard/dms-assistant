@@ -187,6 +187,12 @@ class ChatReply(_Model):
     points: list[ReplyPoint] = Field(default_factory=list)   # «Что сказано в договоре» — ≤ REPLY_POINTS_MAX
     ask: list[str] = Field(default_factory=list)  # «Что уточнить» — вопросы к менеджеру/сотруднику, без дублей
     caution: str | None = None                   # одна строка: «Ответ — по документам; решение СК …», допущения
+    # варианты ответа на уточняющий вопрос (названия программ договора): клик отправляет вариант как ответ (w16)
+    options: list[str] = Field(default_factory=list)
+    # как модель-помощник поняла вопрос, написанный своими словами (assist.rephrase, w17); None — понят правилами
+    understood: str | None = None
+    # служебное сообщение, а не ответ по документам (загрузка вложения, «привет», «не понял вопрос»): без статуса
+    service: bool = False
 
 
 class PerContract(_Model):
@@ -265,6 +271,8 @@ class Automation(_Model):
 class Message(_Model):
     role: Literal["user", "assistant"]
     text: str | None = None
+    # вопрос, который ушёл в движок: ответ на уточнение склеен с исходным вопросом (followup.py, w16)
+    asked: str | None = None
     answer: Answer | None = None
     created_at: dt.datetime
 

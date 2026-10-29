@@ -194,6 +194,7 @@ field}}` по-русски (ServiceError). Тела ≤ DMS_MAX_JSON_KB, фай�
 | `GET /api/documents?contract_id=&group_id=` · `GET /api/documents/{id}` | → `[Document]` / `Document` |
 | `GET /api/documents/{id}/clauses` | → `{clauses: [Clause], total, truncated}` — пункты документа по порядку (оператор) |
 | `GET /api/documents/{id}/clause?number=&path=&ref=` | → `{clause: Clause}` или `{clinic: ClinicRow}` (по ref) — для панели «Источники» |
+| ↳ параметр `ref` (w16-sec) | точная ссылка цитаты `Citation.ref` (`c08.program#t14r0p77`, с `@vN` или без) → ровно этот пункт; без `ref` и при нескольких разных пунктах с номером `number` — 409 `ambiguous_clause` |
 | `POST /api/documents` (multipart: file, contract_id, group_id, doc_type?, uploaded_by) | → `Document` (разбор и статусы ТЗ п. 7.1) |
 | `POST /api/documents/import-kit` | → отчёт импорта (`ingest_report`, без текстов) |
 | `POST /api/chats` `{context: ChatContext, title?}` · `GET /api/chats` · `GET /api/chats/{id}` | → `Chat` (+ `requests` в GET по id) |

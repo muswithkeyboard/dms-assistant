@@ -14,7 +14,8 @@
     sources: [], sourceSel: null, clauseCache: {}, draftTab: "hr",
     docTitles: {}, stickyError: null, offerOpen: false, lastCite: null,
     clinicFind: {}, clinicRows: {},
-    rateOpen: false, detailsOpen: {}
+    rateOpen: false, detailsOpen: {},
+    att: { items: [], active: null }, attFile: null
   };
 
   // ---------- контекст: названия групп и договоров ----------
@@ -31,8 +32,11 @@
     if (!c) { return id || T("common.none"); }
     return c.legal_entity + (c.number ? " · № " + c.number : "");
   }
-  // Текст пункта для показа: без маркера списка «- » / «• » в начале (так пункты приходят из разбора docx).
-  function cleanText(s) { return String(s || "").replace(/^\s*[-–—•·]\s+/, ""); }
+  // Текст пункта для показа: без маркера списка «- » / «• » в начале (так пункты приходят из разбора docx)
+  // и без разметки сносок документа «[^7]» (ревизия w16: «томография[^7]» в пузыре и в панели источников).
+  var FOOTNOTE_RE = /\[\^\d+\]/g;
+  function noFootnotes(s) { return String(s || "").replace(FOOTNOTE_RE, ""); }
+  function cleanText(s) { return noFootnotes(s).replace(/^\s*[-–—•·]\s+/, ""); }
   // Укоротить до n символов по границе слова и поставить «…» (полный текст — в правой панели).
   function shorten(s, n) {
     s = cleanText(s);
@@ -78,11 +82,13 @@
     ctx = ctx || {};
     return [ctx.contract_id ? contractShort(ctx.contract_id) : groupName(ctx.group_id), ctx.program].filter(Boolean).join(" · ");
   }
+  // Подпись чата в списке: договор (или число договоров группы) и программа, если задана — два чата по одному
+  // договору с разными программами различимы (ревизия w16).
   function chatSub(ctx) {
     ctx = ctx || {};
-    if (ctx.contract_id) { return contractShort(ctx.contract_id); }
     var g = state.groupById[ctx.group_id];
-    return g ? T("chat.head_contracts_n", { n: (g.contracts || []).length }) : "";
+    var base = ctx.contract_id ? contractShort(ctx.contract_id) : g ? T("chat.head_contracts_n", { n: (g.contracts || []).length }) : "";
+    return [base, ctx.program].filter(Boolean).join(" · ");
   }
   function contextKv(ctx, opts) {
     ctx = ctx || {}; opts = opts || {};
@@ -137,9 +143,11 @@
     if (!state.chats.length) { list.appendChild(el("li", { class: "navlist__empty muted", text: T("chat.chats_empty") })); return; }
     state.chats.forEach(function (c) {
       // Компактно: название и серым — договор (или число договоров группы); дата создания — в подсказке.
-      var btn = el("button", { type: "button", class: "navlist__item", "aria-current": state.chat && state.chat.id === c.id ? "true" : null,
+      var btn = el("button", { type: "button", class: "navlist__item navlist__item--ico", "aria-current": state.chat && state.chat.id === c.id ? "true" : null,
         title: c.created_at ? T("chat.chat_created", { at: D.fmtDateTime(c.created_at) }) : null,
         on: { click: function () { closeSide(); selectChat(c.id); } } }, [
+        // Иконка контекста: группа компаний — здание, один договор — человек (сотрудники компании).
+        el("span", { class: "ico ico--sm ico--" + (c.context && c.context.contract_id ? "person" : "building"), "aria-hidden": "true" }),
         el("span", { class: "navlist__title", text: chatTitle(c) }),
         el("span", { class: "navlist__sub", text: chatSub(c.context) })
       ]);
@@ -163,11 +171,21 @@
     setAskEnabled(true);
     D.writeHash({ chat: c.id, req: reqId || null });
     loadDocTitles(c.context).then(function () { if (state.chat === c && state.req) { renderRequest(); } });
+    state.att = { items: [], active: null }; renderAttBar(); loadAttachments();
     // Пока грузился список, адрес мог смениться («Назад», правка) — открываем запрос из текущего адреса.
     return loadRequests().then(function () {
       if (state.chat !== c) { return; }
-      var h = D.readHash();
-      return openRequestById(h.chat === c.id ? (h.req || null) : reqId);
+      var h = D.readHash(), want = h.chat === c.id ? (h.req || null) : reqId;
+      if (want) { return openRequestById(want); }
+      // Без &req= открываем последнее открытое обращение (список — новые сверху), иначе последнее вообще:
+      // при одном обращении список слева скрыт, и пустой чат выглядел бы как потерянная история (ревизия w16).
+      var open = state.requests.filter(function (x) { return x.status !== "closed"; })[0] || state.requests[0];
+      if (open) { return openRequestById(open.id); }
+      return D.request("GET", "/api/chats/" + encodeURIComponent(c.id) + "/requests?status=all").then(function (r) {
+        if (state.chat !== c || state.req) { return; }
+        var last = r.ok && Array.isArray(r.data) ? r.data[0] : null;
+        return openRequestById(last ? last.id : null);
+      });
     });
   }
   // Запрос из адреса (#req=): есть в списке — выбираем; закрыт и скрыт фильтром — открываем без выделения в списке
@@ -269,19 +287,20 @@
   // ---------- лента сообщений ----------
   function renderRequest() {
     var box = $("messages"), tools = $("request-tools");
+    hidePreview(false);   // ссылка, к которой привязано превью, сейчас исчезнет вместе с лентой
     clear(box); clear(tools);
     showAlert("");
     renderMenu();
     if (!state.chat) {
-      box.appendChild(el("p", { class: "muted chat__empty", text: T("chat.pick_chat") }));
-      box.appendChild(suggestions());
+      box.appendChild(hero());
+      appendSuggestions(box);
       return;
     }
     var q = state.req;
     if (!q) {
       // Пустой чат: приветствие ассистента и подсказки-примеры; первый вопрос создаст обращение сам.
       box.appendChild(el("div", { class: "msg msg--bot intro" }, [el("p", { text: T("chat.intro_text") })]));
-      box.appendChild(suggestions());
+      appendSuggestions(box);
       setAskEnabled(true);
       return;
     }
@@ -291,7 +310,10 @@
     (q.messages || []).forEach(function (m, i) {
       if (m.role === "user") { box.appendChild(userBubble(m.text, m.created_at)); }
       // Ответ словами (ADR 0014) — если сервер прислал reply; иначе прежняя карточка (обратная совместимость).
-      else if (m.answer) { box.appendChild(m.answer.reply ? replyBubble(m.answer, i, i === lastAnswerIdx) : answerCard(m.answer, i, i === lastAnswerIdx)); }
+      else if (m.answer) {
+        var node = m.answer.reply ? replyBubble(m.answer, i, i === lastAnswerIdx) : answerCard(m.answer, i, i === lastAnswerIdx);
+        box.appendChild(supersededByPick(q.messages, i) ? prevFold(node, i) : node);
+      }
       else if (m.text) { box.appendChild(el("article", { class: "msg msg--bot" }, [el("p", { text: m.text })])); }
     });
     if (q.automation) { box.appendChild(automationCard(q)); }
@@ -300,6 +322,28 @@
     setAskEnabled(q.status !== "closed");
     // Шторка источников по меню «Все источники» — сноски последнего ответа.
     if (lastAnswerIdx >= 0 && !state.sources.length) { state.sources = orderedSources(q.messages[lastAnswerIdx].answer); }
+  }
+  // Выбор клиники пересчитывает ответ (POST …/clinic): сервер добавляет реплику «Клиника: …» и новый ответ, прежний
+  // остаётся в истории. Ответ, ждавший выбора клиники, за которым следует ответ с учтённым выбором, — сворачиваем
+  // под «Подробнее» (не удаляя), чтобы лента не удваивалась (ревизия w16).
+  function pendingPick(a) { return (a.clinic_choices || []).some(function (ch) { return ch.selected === null || ch.selected === undefined; }); }
+  function supersededByPick(msgs, i) {
+    if (!pendingPick(msgs[i].answer)) { return false; }
+    for (var j = i + 1; j < msgs.length; j += 1) {
+      if (msgs[j].answer) { return (msgs[j].answer.clinic_choices || []).some(function (ch) { return ch.selected !== null && ch.selected !== undefined; }); }
+    }
+    return false;
+  }
+  function prevFold(node, msgIdx) {
+    var key = "prev|" + detailsKey(msgIdx), open = !!state.detailsOpen[key];
+    var id = "prev-" + String(msgIdx) + "-" + Math.floor(Math.random() * 1e6);
+    var body = el("div", { class: "prev__body", id: id, hidden: !open }, [node]);
+    var btn = el("button", { type: "button", class: "btn btn--small btn--link prev__btn", "aria-expanded": open ? "true" : "false", "aria-controls": id,
+      text: T(open ? "reply.prev_hide" : "reply.prev_show"), on: { click: function () {
+        var now = body.hidden; body.hidden = !now; state.detailsOpen[key] = now;
+        btn.setAttribute("aria-expanded", now ? "true" : "false"); btn.textContent = T(now ? "reply.prev_hide" : "reply.prev_show");
+      } } });
+    return el("div", { class: "prev" }, [el("p", { class: "prev__bar" }, [el("span", { class: "prev__t", text: T("reply.prev_before_pick") }), " ", btn]), body]);
   }
   // Лента прокручивается к началу последнего ответа (длинный ответ читается сверху), без ответа — в конец.
   // Вызывается при открытии обращения и после нового ответа, но не при перерисовке (вкладки черновиков и т. п.).
@@ -315,12 +359,49 @@
       at ? el("p", { class: "msg__who", text: D.fmtDateTime(at) }) : null
     ]);
   }
+  // Приветствие без выбранного чата: ASCII-арт темы (CSS --art-hero), заголовок, «Новый чат» и три шага.
+  function hero() {
+    var steps = el("ol", { class: "hero__steps", "aria-label": T("chat.hero_steps_title") });
+    [["building", "chat.hero_step1"], ["laptop", "chat.hero_step2"], ["chart", "chat.hero_step3"]].forEach(function (s, i) {
+      steps.appendChild(el("li", { class: "hero__step" }, [
+        el("span", { class: "ico-tile" }, [el("span", { class: "ico ico--" + s[0], "aria-hidden": "true" })]),
+        el("span", { class: "hero__n", text: "0" + String(i + 1) }),
+        el("span", { text: T(s[1]) })
+      ]));
+    });
+    return el("div", { class: "hero" }, [
+      el("div", { class: "hero__art", "aria-hidden": "true" }),
+      el("span", { class: "ico-tile ico-tile--lg" }, [el("span", { class: "ico ico--md ico--doctor", "aria-hidden": "true" })]),
+      el("p", { class: "hero__t", text: T("chat.hero_title") }),
+      el("p", { class: "hero__p", text: T("chat.hero_text") }),
+      el("button", { type: "button", class: "btn btn--primary", text: "+ " + T("chat.new_chat"), on: { click: function () { $("new-chat-btn").click(); } } }),
+      steps
+    ]);
+  }
+  // Иконка примера по теме вопроса (только оформление): правила — ui.yaml chat.example_icons, список по порядку
+  // ({icon, words}: основы слов); первое совпавшее правило, иначе — врач. Список, а не словарь: tojson сортирует ключи.
+  function exampleIcon(q) {
+    var s = String(q || "").toLowerCase(), hit = "doctor";
+    (D.cfg("chat.example_icons") || []).some(function (r) {
+      if ((r.words || []).some(function (w) { return s.indexOf(w) >= 0; })) { hit = r.icon; return true; }
+      return false;
+    });
+    return hit;
+  }
+  // Примеров нет — блок подсказок не добавляется (appendChild(null) бросал ошибку на каждой отрисовке пустого чата).
+  function appendSuggestions(box) { var s = suggestions(); if (s) { box.appendChild(s); } }
   // Подсказки-примеры в пустом чате: до 4 первых примеров кнопками; остальные — «Примеры вопросов» над полем ввода.
   function suggestions() {
     if (!state.examples.length) { return null; }
     var ul = el("ul", { class: "suggest__list" });
     state.examples.slice(0, 4).forEach(function (ex) {
-      ul.appendChild(el("li", null, [el("button", { type: "button", class: "suggest__btn", on: { click: function () { runExample(ex); } } }, [ex.question || ex.title || ""])]));
+      ul.appendChild(el("li", null, [el("button", { type: "button", class: "suggest__btn", on: { click: function () { runExample(ex); } } }, [
+        el("span", { class: "ico ico--sm ico--" + exampleIcon(ex.question || ex.title), "aria-hidden": "true" }),
+        el("span", { class: "suggest__body" }, [
+          el("span", { text: ex.question || ex.title || "" }),
+          ex.context ? el("span", { class: "suggest__ctx", text: T("chat.example_ctx", { ctx: ex.context.contract_id ? contractShort(ex.context.contract_id) : groupName(ex.context.group_id) }) }) : null
+        ])
+      ])]));
     });
     return el("div", { class: "suggest" }, [el("p", { class: "hint", text: T("chat.suggest_title") }), ul]);
   }
@@ -390,10 +471,9 @@
     return (st.citations || []).map(function (c) {
       var n = 0;
       sources.forEach(function (s, i) { if (citeKey(s) === citeKey(c)) { n = i + 1; } });
-      var b = el("button", { type: "button", class: "cite", "data-n": String(n), title: docTitle(c) + (citeWhere(c) ? ", " + citeWhere(c) : ""),
-        "aria-label": T("answer.open_source") + " " + n + ": " + docTitle(c),
-        on: { click: function () { openSource(sources, n - 1, b); } } }, ["[" + n + "]"]);
-      return b;
+      // Без title: подсказку браузера заменяет превью источника (sourceLink).
+      return sourceLink("cite", c, sources, n - 1, { "data-n": String(n),
+        "aria-label": T("answer.open_source") + " " + n + ": " + docTitle(c) + (citeWhere(c) ? ", " + citeWhere(c) : "") }, ["[" + n + "]"]);
     });
   }
   function statementList(stmts, sources) {
@@ -435,49 +515,113 @@
     var r = a.reply, sources = orderedSources(a);
     var group = !(a.context || {}).contract_id;
     var art = el("article", { class: "msg msg--bot answer reply", "aria-label": T("chat.assistant") });
+    // 0. Как модель-помощник поняла вопрос своими словами (ADR 0015) — до ответа, чтобы менеджер видел трактовку
+    if (r.understood) {
+      art.appendChild(el("p", { class: "reply__understood" }, [el("span", { class: "reply__understood-k", text: T("reply.understood") + " " }),
+        el("q", { text: r.understood })]));
+    }
     // 1. Прямой ответ: метка и lead (1–2 фразы).
     // lead уже начинается с метки словами («Недостаточно данных: …», слайд 13) — чип не дублирует её, а метка
     // в начале lead выделяется цветом метки
-    var lead = r.lead || a.summary || "", chip = verdictChip(verdictOf(a)), m = /^([^:]{3,40}):\s*/.exec(lead);
+    var lead = noFootnotes(r.lead || a.summary || ""), chip = verdictChip(verdictOf(a)), m = byAttachment(a) ? null : /^([^:]{3,40}):\s*/.exec(lead);
     var leadNodes = m ? [el("strong", { class: "reply__verdict reply__verdict--" + verdictOf(a), text: m[1] + ": " }), lead.slice(m[0].length)]
                       : [chip, " ", lead];
     art.appendChild(el("p", { class: "reply__lead" }, [el("span", { class: "reply__lead-t" }, leadNodes)]));
+    // 1а. Варианты ответа на уточняющий вопрос (reply.options, напр. программы): клик сразу отправляет вариант
+    // как реплику менеджера — как Enter в поле ввода; сервер сам склеит его с исходным вопросом.
+    var opts = (r.options || []).filter(function (o) { return typeof o === "string" && o.trim(); });
+    if (opts.length) {
+      var live = isLast && state.req && state.req.status !== "closed";
+      art.appendChild(el("ul", { class: "reply__opts", "aria-label": T("reply.options_label") }, opts.map(function (o) {
+        return el("li", null, [live
+          ? el("button", { type: "button", class: "reply__opt", disabled: state.busy, on: { click: function () { if (!state.busy) { ask(o.trim()); } } } }, [o.trim()])
+          : el("span", { class: "reply__opt is-off", text: o.trim() })]);
+      })));
+    }
     // 2. Выбор клиники (ADR 0010) — компактно внутри сообщения: от него зависит метка.
     if ((a.clinic_choices || []).length) { art.appendChild(clinicPickCard(a, isLast, msgIdx, true)); }
     // 3. «Что сказано в договоре»: формулировка, цитата курсивом, строка источника со сноской [n].
     var points = r.points || [];
     if (points.length) {
-      art.appendChild(el("h3", { class: "reply__h", text: T(group ? "reply.points_title_group" : "reply.points_title") }));
+      art.appendChild(el("h3", { class: "reply__h", text: T(byAttachment(a) ? "reply.points_title_attachment" : group ? "reply.points_title_group" : "reply.points_title") }));
       var ol = el("ul", { class: "reply__points" }), lastCid = null;
-      points.forEach(function (p) {
+      // Видны первые POINTS_SHOWN пунктов (в ГК — все: по пункту на договор), остальные — под «Ещё N»: главное
+      // читается сразу, текст не давит (упрощение интерфейса 29.10.2026).
+      var showAll = group || points.length <= POINTS_SHOWN + 1 || !!state.detailsOpen["pts|" + detailsKey(msgIdx)];
+      points.forEach(function (p, i) {
         // ГК: пункты одного договора идут подряд под подписью «Договор № N» (ADR 0005: условия не смешиваются).
         if (group && p.contract_id && p.contract_id !== lastCid) {
           ol.appendChild(el("li", { class: "reply__ctr", text: contractShort(p.contract_id) }));
           lastCid = p.contract_id;
         }
-        ol.appendChild(pointItem(p, sources));
+        var item = pointItem(p, sources);
+        if (!showAll && i >= POINTS_SHOWN) { item.hidden = true; item.classList.add("reply__pt--extra"); }
+        ol.appendChild(item);
       });
       art.appendChild(ol);
+      if (!showAll) {
+        var extra = points.length - POINTS_SHOWN;
+        art.appendChild(el("button", { type: "button", class: "btn btn--small btn--link reply__morepts", text: T("reply.more_points", { n: extra }),
+          on: { click: function (e) {
+            state.detailsOpen["pts|" + detailsKey(msgIdx)] = true;
+            ol.querySelectorAll(".reply__pt--extra").forEach(function (x) { x.hidden = false; });
+            e.currentTarget.remove();
+          } } }));
+      }
     }
-    // 4. «Что уточнить»: вопросы; в последнем ответе клик — заготовка в поле ввода.
-    if ((r.ask || []).length) {
-      art.appendChild(el("h3", { class: "reply__h", text: T("reply.ask_title") }));
-      art.appendChild(el("ul", { class: "reply__ask" }, r.ask.map(function (q) {
-        return el("li", null, [isLast && state.req && state.req.status !== "closed"
-          ? el("button", { type: "button", class: "reply__askbtn", title: T("reply.ask_use"), on: { click: function () { useQuestion(q); } } }, [q])
-          : el("span", { text: q })]);
-      })));
+    // 4. «Что уточнить»: в последнем ответе кнопкой (клик — заготовка в поле ввода) — только формулировки-вопросы
+    // (кончаются на «?»); утверждения («Клиника … не найдена», «Не названа услуга…») — обычным текстом (ревизия w16).
+    var asks = mergeAsks((r.ask || []).map(function (q) { return String(q || "").trim(); }).filter(Boolean));
+    if (asks.length) {
+      var canUse = isLast && state.req && state.req.status !== "closed";
+      // «Что уточнить» — отдельным заметным блоком: то, что менеджеру нужно добавить, чтобы получить ответ. В последнем
+      // ответе у каждого вопроса — готовые варианты (да / нет, «А или Б») и поле «свой ответ»: ответ сразу уходит
+      // ассистенту вместе с вопросом (clarify) и склеивается с исходным вопросом (followup.clarify_reply).
+      var askBox = el("div", { class: "reply__askbox" }, [el("h3", { class: "reply__h reply__h--ask", text: T("reply.ask_title") })]);
+      art.appendChild(askBox);
+      if (canUse && asks.some(function (q) { return q.indexOf("?") > 0; })) { askBox.appendChild(el("p", { class: "reply__askhint", text: T("reply.clarify_hint") })); }
+      // уже отвеченные в этом обращении вопросы не спрашиваются снова: строка «✓ вопрос — ответ»
+      var done = canUse ? answeredClarify(state.req) : {};
+      // Один главный вопрос (первый неотвеченный: сервер ставит вперёд то, от чего зависит вывод) раскрыт, остальные
+      // вопросы — под «Ещё N вопросов»: менеджер отвечает по одному, а не на всё сразу
+      var shownQ = 0, hiddenQ = [];
+      var askList = el("ul", { class: "reply__ask" }, asks.map(function (q) {
+        var qi = q.indexOf("?"), isQ = qi > 0;
+        if (!isQ) { return el("li", { class: "reply__note" }, [el("span", { text: q })]); }
+        var question = q.slice(0, qi + 1).trim(), why = q.slice(qi + 1).trim();
+        if (!canUse) { return el("li", null, [el("span", { text: q })]); }
+        if (done[question] !== undefined) { return el("li", { class: "clar clar--done" }, [el("span", { text: "\u2713 " + question + " \u2014 " + done[question] })]); }
+        var li = el("li", { class: "clar" }, clarifyItem(question, why));
+        shownQ += 1;
+        if (shownQ > 1 && !state.detailsOpen["asks|" + detailsKey(msgIdx)]) { li.hidden = true; hiddenQ.push(li); }
+        return li;
+      }));
+      askBox.appendChild(askList);
+      if (hiddenQ.length) {
+        askBox.appendChild(el("button", { type: "button", class: "btn btn--small btn--link reply__moreasks", text: T("reply.more_asks", { n: hiddenQ.length }),
+          on: { click: function (e) {
+            state.detailsOpen["asks|" + detailsKey(msgIdx)] = true;
+            hiddenQ.forEach(function (x) { x.hidden = false; });
+            e.currentTarget.remove();
+          } } }));
+      }
     }
     // Кнопка «Добавить клинику» по answer.suggested_automation (движок) — в последнем ответе.
     if (isLast && (a.suggested_automation || state.offerOpen) && state.req && !state.req.automation && state.req.status !== "closed") {
       art.appendChild(automationOffer());
     }
-    // 5. Мелко: статус ТЗ п. 8.1 (без процентов) и ограничения.
+    // 5. Мелко: статус ТЗ п. 8.1 (без процентов) и ограничения; «Скопировать ответ» — текст для HR (ревью сайта
+    // 29.10.2026): вывод, пункты с цитатами и источниками, что уточнить; без служебного.
+    var copyStatus = el("span", { class: "hint reply__copied", role: "status" });
     var foot = el("div", { class: "reply__foot" }, [
-      a.confidence ? el("p", { class: "reply__status status--" + a.confidence }, [T("reply.status") + ": ", T("confidence." + a.confidence)]) : null,
-      r.caution ? el("p", { class: "reply__caution", text: r.caution }) : null
+      a.confidence && !r.service ? el("p", { class: "reply__status status--" + a.confidence }, [T("reply.status") + ": ", T("confidence." + a.confidence)]) : null,
+      // оговорка «решение — за СК» одна и та же у каждого ответа — показываем у последнего
+      r.caution && isLast ? el("p", { class: "reply__caution", text: r.caution }) : null
     ]);
     art.appendChild(foot);
+    var copyBtn = r.service ? null : el("button", { type: "button", class: "btn btn--small btn--link reply__copybtn", text: T("reply.copy"), on: { click: function () {
+      copyText(replyText(a, lead, sources), art).then(function (ok) { copyStatus.textContent = ok ? T("reply.copied") : T("errors.copy_failed"); });
+    } } });
     // 6. «Подробнее»: прежние блоки (основания, контекст, альтернативы, источники, технические детали) — скрыты.
     var key = detailsKey(msgIdx), did = "more-" + String(msgIdx) + "-" + Math.floor(Math.random() * 1e6);
     var open = !!state.detailsOpen[key];
@@ -487,20 +631,26 @@
         var now = more.hidden; more.hidden = !now; state.detailsOpen[key] = now;
         btn.setAttribute("aria-expanded", now ? "true" : "false"); btn.textContent = T(now ? "reply.less" : "reply.more");
       } } });
-    art.appendChild(el("div", { class: "reply__morebar" }, [btn]));
+    // письмо HR / запрос в СК из этого ответа (Service.letter): шаблон конфига, основание — проверенные пункты
+    var letterBtns = r.service ? [] : [["hr", "letters.btn_hr"], ["insurer", "letters.btn_insurer"]].map(function (x) {
+      return el("button", { type: "button", class: "btn btn--small btn--link reply__letter", text: T(x[1]), on: { click: function () { openLetter(x[0], msgIdx); } } });
+    });
+    art.appendChild(el("div", { class: "reply__morebar" }, [btn, copyBtn].concat(letterBtns).concat([copyStatus])));
     art.appendChild(more);
     return art;
   }
   function pointItem(p, sources) {
     var cites = pointCites(p, sources);
     var li = el("li", { class: "reply__pt" }, [el("p", { class: "reply__text", text: cleanText(p.text) })]);
-    if (p.quote) { li.appendChild(el("p", { class: "reply__quote", text: "«" + shorten(p.quote, 260) + "»" })); }
+    // цитата, которая слово в слово повторяет формулировку (строка таблицы), не дублируется: проверенный фрагмент —
+    // в превью и шторке источника по ссылке ниже
+    if (p.quote && !sameWords(p.text, p.quote)) { li.appendChild(el("p", { class: "reply__quote", text: "«" + shorten(p.quote, 260) + "»" })); }
     if (cites.length) {
       var src = el("p", { class: "reply__src" }, [el("span", { class: "reply__srck", text: T("reply.source") + ": " })]);
       cites.forEach(function (c, i) {
         var n = sources.indexOf(c) + 1, where = citeWhere(c);
-        var b = el("button", { type: "button", class: "reply__ref", "aria-label": T("answer.open_source") + " " + n + ": " + docTitle(c) + (where ? ", " + where : ""),
-          on: { click: function () { openSource(sources, n - 1, b); } } }, [el("span", { class: "cite", "aria-hidden": "true", text: "[" + n + "]" }), " ", docTitle(c) + (where ? ", " + where : "")]);
+        var b = sourceLink("reply__ref", c, sources, n - 1, { "aria-label": T("answer.open_source") + " " + n + ": " + docTitle(c) + (where ? ", " + where : "") },
+          [el("span", { class: "cite", "aria-hidden": "true", text: "[" + n + "]" }), " ", el("span", { class: "reply__reft", text: docTitle(c) + (where ? ", " + where : "") })]);
         if (i) { src.appendChild(document.createTextNode("; ")); }
         src.appendChild(b);
       });
@@ -508,10 +658,103 @@
     }
     return li;
   }
+  // Ответ простым текстом для письма или мессенджера: первая фраза, «Что сказано в договоре» (формулировка, цитата,
+  // источник: документ и пункт), «Что уточнить» и оговорка о решении СК.
+  function replyText(a, lead, sources) {
+    var r = a.reply || {}, lines = [lead.trim()], group = !(a.context || {}).contract_id, lastCid = null;
+    var points = r.points || [];
+    if (points.length) {
+      lines.push("", T(byAttachment(a) ? "reply.points_title_attachment" : group ? "reply.points_title_group" : "reply.points_title") + ":");
+      points.forEach(function (p) {
+        if (group && p.contract_id && p.contract_id !== lastCid) { lines.push(contractShort(p.contract_id) + ":"); lastCid = p.contract_id; }
+        lines.push("— " + cleanText(p.text));
+        if (p.quote) { lines.push("  «" + p.quote + "»"); }
+        var cites = pointCites(p, sources).map(function (c) { var w = citeWhere(c); return docTitle(c) + (w ? ", " + w : ""); });
+        if (cites.length) { lines.push("  " + T("reply.source") + ": " + cites.join("; ")); }
+      });
+    }
+    var asks = (r.ask || []).map(function (q) { return String(q || "").trim(); }).filter(Boolean);
+    if (asks.length) { lines.push("", T("reply.ask_title") + ":"); asks.forEach(function (q) { lines.push("— " + q); }); }
+    if (r.caution) { lines.push("", r.caution); }
+    return lines.join("\n");
+  }
+  // Формулировка и цитата из одних и тех же слов (≥ 85 % слов цитаты есть в формулировке)?
+  function sameWords(text, quote) {
+    function words(x) { return String(x || "").toLowerCase().split(/[^0-9a-z\u0430-\u044f\u0451]+/i).filter(function (w) { return w.length > 1; }); }
+    var t = {}, q = words(quote), hit = 0;
+    words(text).forEach(function (w) { t[w] = true; });
+    q.forEach(function (w) { if (t[w]) { hit += 1; } });
+    return q.length > 0 && hit / q.length >= 0.85;
+  }
+  // В чате ГК один и тот же вопрос приходит по каждому договору («Договор № 1: Какая программа…?», «Договор № 2: …»).
+  // Застрахованный один — такой вопрос показывается один раз, без подписи договора; ответ склеится с исходным
+  // вопросом и пойдёт по всем договорам группы. Вопрос только одного договора остаётся с подписью.
+  function mergeAsks(list) {
+    var out = [], at = {};
+    list.forEach(function (q) {
+      var m = /^[^:?]{2,40}:\s+(.+)$/.exec(q), core = m ? m[1].trim() : q, key = core.toLowerCase();
+      if (at[key] !== undefined) { out[at[key]] = core; return; }
+      at[key] = out.length; out.push(q);
+    });
+    return out;
+  }
+  // Вопрос из «Что уточнить»: формулировка, пояснение, кнопки готовых ответов и поле «свой ответ».
+  function clarifyItem(question, why) {
+    var opts = clarifyOptions(question), progs = askProgramOptions(question), listId = null, datalist = null;
+    // вопрос о программе: программы договоров чата — кнопками (до PROGRAM_BUTTONS_MAX), больше — подсказками в поле
+    if (progs.length && progs.length <= PROGRAM_BUTTONS_MAX) { opts = progs; }
+    else if (progs.length) {
+      listId = "clar-progs-" + Math.floor(Math.random() * 1e6);
+      datalist = el("datalist", { id: listId }, progs.map(function (p) { return el("option", { value: p }); }));
+    }
+    var input = el("input", { type: "text", class: "clar__input", maxlength: "300", list: listId, placeholder: T(listId ? "reply.clarify_program" : "reply.clarify_own"), "aria-label": question });
+    var send = el("button", { type: "submit", class: "btn btn--small btn--primary", text: T("reply.clarify_send") });
+    var form = el("form", { class: "clar__own", novalidate: true, on: { submit: function (e) {
+      e.preventDefault();
+      var v = input.value.trim();
+      if (!v) { input.focus(); return; }
+      ask(v, question);
+    } } }, [input, send]);
+    var row = el("div", { class: "clar__row" }, opts.map(function (o) {
+      return el("button", { type: "button", class: "reply__opt", disabled: state.busy, text: o, on: { click: function () { if (!state.busy) { ask(o, question); } } } });
+    }).concat([form, datalist]));
+    return [el("p", { class: "clar__q", text: question }), why ? el("p", { class: "clar__why", text: why }) : null, row];
+  }
+  // Вопрос о программе (основа из ui.yaml reply.clarify_program_stem) → названия программ договоров чата без повторов.
+  function askProgramOptions(question) {
+    var stem = T("reply.clarify_program_stem"), ctx = (state.chat && state.chat.context) || {}, names = {}, out = [];
+    if (question.toLowerCase().indexOf(stem) < 0) { return []; }
+    var contracts = ctx.contract_id ? [state.contractById[ctx.contract_id]] :
+      ((state.groups.filter(function (g) { return g.id === ctx.group_id; })[0] || {}).contracts || []);
+    contracts.forEach(function (c) {
+      ((c && c.programs) || []).forEach(function (p) { var n = typeof p === "string" ? p : p.name; if (n && !names[n]) { names[n] = true; out.push(n); } });
+    });
+    return out;
+  }
+  // Ответы менеджера на вопросы «Что уточнить» в этом обращении: реплика «вопрос? — ответ» → {вопрос?: ответ}.
+  function answeredClarify(req) {
+    var out = {};
+    ((req && req.messages) || []).forEach(function (m) {
+      var t = m.role === "user" ? String(m.text || "") : "", i = t.indexOf("? \u2014 ");
+      if (i > 0) { out[t.slice(0, i + 1)] = t.slice(i + 4); }
+    });
+    return out;
+  }
+  // Готовые ответы на вопрос: «А или Б?» — варианты (если вопрос короткий); вопрос «да/нет» (начинается с основы из
+  // ui.yaml reply.clarify_yesno) — «Да» и «Нет»; иначе — только свой ответ.
+  function clarifyOptions(question) {
+    var s = question.replace(/[?\uff1f]\s*$/, "").trim(), low = s.toLowerCase(), or = T("reply.clarify_or");
+    if (low.indexOf(or) > 0 && s.split(/\s+/).length <= 8) {
+      return s.split(new RegExp(or, "i")).map(function (x) { x = x.trim(); return x.charAt(0).toUpperCase() + x.slice(1); }).filter(Boolean).slice(0, 4);
+    }
+    var yesno = D.cfg("reply.clarify_yesno") || [];
+    if (yesno.some(function (st) { return low.indexOf(st) === 0; })) { return [T("reply.yes"), T("reply.no")]; }
+    return [];
+  }
   function useQuestion(q) {
     var t = $("question");
     if (t.disabled) { return; }
-    t.value = q + "\n"; autoGrow(); t.focus(); t.setSelectionRange(t.value.length, t.value.length);
+    t.value = String(q || "").trim(); autoGrow(); countInput(); t.focus(); t.setSelectionRange(t.value.length, t.value.length);
   }
 
   // ---------- блоки подробностей (прежняя карточка ответа) ----------
@@ -521,7 +764,7 @@
     var out = [];
     if (opts.reply) {
       var tech = [D.modeChip(a.mode), a.scenario ? el("span", { class: "answer__scn", text: T("scenarios." + a.scenario) }) : null].filter(Boolean);
-      if (a.summary) { out.push(card(T("answer.summary"), [el("p", { text: a.summary }), a.label_note ? el("p", { class: "muted", text: a.label_note }) : null])); }
+      if (a.summary) { out.push(card(T("answer.summary"), [el("p", { text: noFootnotes(a.summary) }), a.label_note ? el("p", { class: "muted", text: a.label_note }) : null])); }
       if (tech.length) { out.push(el("div", { class: "answer__chips" }, tech)); }
     }
     // Применённый контекст. В чате по одному договору он уже в шапке — свёрнут; у группы — раскрыт.
@@ -568,7 +811,7 @@
     sources.forEach(function (c, i) {
       var q = norm(c.quote);
       var dup = !q || shown.some(function (t) { return t.indexOf(q) >= 0 || (t.length > 40 && q.indexOf(t) >= 0); });
-      var b = el("button", { type: "button", class: "srclist__btn", on: { click: function () { openSource(sources, i, b); } } }, [
+      var b = sourceLink("srclist__btn", c, sources, i, null, [
         el("span", { class: "cite", text: "[" + (i + 1) + "]" }), " ",
         el("span", { class: "srclist__doc", text: docTitle(c) }), citeWhere(c) ? el("span", { class: "source", text: " · " + citeWhere(c) }) : null,
         citeContract(c) ? el("span", { class: "srclist__ctr", text: citeContract(c) }) : null,
@@ -589,7 +832,7 @@
     art.appendChild(el("div", { class: "answer__chips" }, [D.labelChip(a.label), D.modeChip(a.mode),
       a.scenario ? el("span", { class: "answer__scn", text: T("scenarios." + a.scenario) }) : null]));
     art.appendChild(el("div", { class: "headline headline--" + (a.label || "none") }, [
-      el("p", { text: a.summary || "" }), a.label_note ? el("p", { class: "headline__note", text: a.label_note }) : null]));
+      el("p", { text: noFootnotes(a.summary) }), a.label_note ? el("p", { class: "headline__note", text: a.label_note }) : null]));
     art.appendChild(el("p", { class: "answer__status status--" + a.confidence }, [
       el("span", { class: "answer__k", text: T("answer.status") + ": " }), T("confidence." + a.confidence)]));
     if ((a.clinic_choices || []).length) { art.appendChild(clinicPickCard(a, isLast, msgIdx, false)); }
@@ -637,6 +880,8 @@
   // compact — внутри ответа словами (ADR 0014): вопрос «Какую клинику имел в виду сотрудник?», до 4 кандидатов,
   // «Другая — найти» (поиск раскрывается по кнопке) и «Нет в перечне»; без длинного пояснения.
   var PICK_COMPACT_MAX = 4;
+  var POINTS_SHOWN = 3;
+  var PROGRAM_BUTTONS_MAX = 6;   // программ на вопрос «Какая программа?» кнопками; больше — подсказками в поле   // пунктов ответа видно сразу; остальные — под «Ещё N»
   function clinicPickCard(a, isLast, msgIdx, compact) {
     var group = !(a.context || {}).contract_id;
     var closed = !state.req || state.req.status === "closed";
@@ -885,6 +1130,7 @@
   }
   // Шторка выезжает справа на любой ширине; фокус — в шторку, при закрытии — обратно на сноску.
   function openDrawer() {
+    hidePreview(false);
     var s = $("sources");
     s.classList.add("is-open");
     $("sources-backdrop").classList.add("is-open");
@@ -925,62 +1171,87 @@
     });
     body.appendChild(ol);
   }
-  // Подсветка цитаты в тексте пункта: точное совпадение, затем — без учёта регистра и пробелов, затем offsets.
+  // Где в тексте пункта цитата: точное совпадение, затем — без учёта регистра и пробелов, затем offsets.
+  function findQuote(text, quote, offsets) {
+    if (quote) {
+      var i = text.indexOf(quote);
+      if (i >= 0) { return [i, i + quote.length]; }
+      var words = quote.trim().split(/\s+/).map(function (w) { return w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); });
+      var m = words.length ? new RegExp(words.join("\\s+"), "i").exec(text) : null;
+      if (m) { return [m.index, m.index + m[0].length]; }
+    }
+    if (offsets && offsets.length === 2 && offsets[1] <= text.length) { return [offsets[0], offsets[1]]; }
+    return null;
+  }
+  // Подсветка цитаты в тексте пункта (mark); не нашлась — текст без подсветки.
   function highlight(text, quote, offsets) {
     var box = el("div", { class: "quote" });
-    var start = -1, end = -1;
-    if (quote) {
-      start = text.indexOf(quote);
-      if (start >= 0) { end = start + quote.length; }
-      else {
-        var words = quote.trim().split(/\s+/).map(function (w) { return w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); });
-        var m = words.length ? new RegExp(words.join("\\s+"), "i").exec(text) : null;
-        if (m) { start = m.index; end = m.index + m[0].length; }
-      }
-    }
-    if (start < 0 && offsets && offsets.length === 2 && offsets[1] <= text.length) { start = offsets[0]; end = offsets[1]; }
-    if (start < 0) { box.appendChild(document.createTextNode(text)); return box; }
-    box.appendChild(document.createTextNode(text.slice(0, start)));
-    box.appendChild(el("mark", { text: text.slice(start, end) }));
-    box.appendChild(document.createTextNode(text.slice(end)));
+    var r = findQuote(text, quote, offsets);
+    if (!r) { box.appendChild(document.createTextNode(text)); return box; }
+    box.appendChild(document.createTextNode(text.slice(0, r[0])));
+    box.appendChild(el("mark", { text: text.slice(r[0], r[1]) }));
+    box.appendChild(document.createTextNode(text.slice(r[1])));
     return box;
+  }
+  // Текст пункта для показа и смещения цитаты в нём. Маркер «- » в начале убирается и в тексте, и в смещениях
+  // (offsets сдвигаются на его длину). Сноски «[^N]» убираются из текста — смещения после этого неверны,
+  // тогда подсветка только по цитате.
+  function clauseText(cl, c) {
+    var raw = cl.text || "", bare = noFootnotes(raw), txt = cleanText(raw), cut = bare.length - txt.length;
+    var offs = bare === raw && c.offsets && c.offsets[0] >= cut ? [c.offsets[0] - cut, c.offsets[1] - cut] : null;
+    return { text: txt, offsets: offs };
+  }
+  // Запрос полного текста пункта (GET /api/documents/{id}/clause). Пункт ищется по ссылке цитаты (c.ref — id пункта
+  // или строки таблицы): номер пункта неоднозначен — в документе бывает несколько «2.1» (ревизия w16: панель
+  // открывала чужой пункт). Нет ссылки — по номеру; не нашлось по ссылке — повтор по номеру.
+  // chat_id: сервер проверит, что документ из договора(ов) контекста чата (ADR 0005).
+  var clausePending = {};
+  function loadClause(c) {
+    if (c._clinic) { return Promise.resolve({ clinic: c._clinic }); }
+    var byNumber = c.clause_number ? "number=" + encodeURIComponent(c.clause_number) : "";
+    var refId = c.ref || c.table_ref || "";
+    var qs = refId ? "ref=" + encodeURIComponent(refId) : byNumber;
+    if (!c.doc_id || !qs) { return Promise.resolve(null); }
+    var chatId = state.req ? state.req.chat_id : state.chat ? state.chat.id : null;
+    var chatQs = chatId ? "&chat_id=" + encodeURIComponent(chatId) : "";
+    var key = c.doc_id + "?" + qs + chatQs;
+    if (state.clauseCache[key]) { return Promise.resolve(state.clauseCache[key]); }
+    if (clausePending[key]) { return clausePending[key]; }
+    var base = "/api/documents/" + encodeURIComponent(c.doc_id) + "/clause?";
+    var p = D.request("GET", base + qs + chatQs).then(function (r) {
+      if (r.ok || !refId || !byNumber || r.status !== 404) { return r; }
+      return D.request("GET", base + byNumber + chatQs);
+    }).then(function (r) {
+      delete clausePending[key];
+      if (r.ok && r.data) { state.clauseCache[key] = r.data; }
+      return r.ok ? r.data : null;
+    });
+    clausePending[key] = p;
+    return p;
   }
   function fragment(c) {
     var wrap = el("div", { class: "srcpanel__body" }, [el("p", { class: "muted", text: T("sources.loading") })]);
     if (c.verified === false) { wrap.appendChild(D.chip(T("sources.not_verified"), "chip--warn chip--bang")); }
-    var qs = c.clause_number ? "number=" + encodeURIComponent(c.clause_number) : c.table_ref ? "ref=" + encodeURIComponent(c.table_ref) : "";
-    // chat_id: сервер проверит, что документ из договора(ов) контекста чата (ADR 0005)
-    var chatId = state.req ? state.req.chat_id : state.chat ? state.chat.id : null;
-    var url = qs + (chatId ? "&chat_id=" + encodeURIComponent(chatId) : "");
-    var key = c.doc_id + "?" + url;
     var done = function (data) {
       clear(wrap);
       if (data && data.clause) {
-        var cl = data.clause;
+        var cl = data.clause, ct = clauseText(cl, c);
         wrap.appendChild(el("p", { class: "source", text: [cl.path, cl.number ? T("answer.clause", { n: cl.number }) : "", cl.page ? T("answer.page", { n: cl.page }) : ""].filter(Boolean).join(" · ") }));
-        // Маркер «- » в начале пункта убирается и в тексте, и в смещениях цитаты (offsets сдвигаются на его длину).
-        var raw = cl.text || "", txt = cleanText(raw), cut = raw.length - txt.length;
-        var offs = c.offsets && c.offsets[0] >= cut ? [c.offsets[0] - cut, c.offsets[1] - cut] : null;
-        wrap.appendChild(highlight(txt, cleanText(c.quote), offs));
+        wrap.appendChild(highlight(ct.text, cleanText(c.quote), ct.offsets));
       } else if (data && data.clinic) {
         wrap.appendChild(clinicRow(data.clinic));
       } else {
         wrap.appendChild(el("p", { class: "muted", text: T("sources.error") }));
         wrap.appendChild(el("p", { class: "source", text: T("sources.quote_only") }));
-        wrap.appendChild(el("div", { class: "quote" }, [el("mark", { text: c.quote || "" })]));
+        wrap.appendChild(el("div", { class: "quote" }, [el("mark", { text: cleanText(c.quote) })]));
       }
-      if (c.doc_id) {
-        var hash = "#doc=" + encodeURIComponent(c.doc_id) + (c.clause_number ? "&clause=" + encodeURIComponent(c.clause_number) : "");
+      if (c.doc_id && !isAttachmentId(c.doc_id)) {
+        var hash = "#doc=" + encodeURIComponent(c.doc_id) + (c.clause_number ? "&clause=" + encodeURIComponent(c.clause_number) : "") +
+          (c.ref ? "&ref=" + encodeURIComponent(c.ref) : "");
         wrap.appendChild(el("p", { class: "srcpanel__open" }, [el("a", { class: "btn btn--small", href: D.link("/documents" + hash), text: T("sources.open_doc") })]));
       }
     };
-    if (c._clinic) { setTimeout(function () { done({ clinic: c._clinic }); }, 0); return wrap; }
-    if (!c.doc_id || !qs) { setTimeout(function () { done(null); }, 0); return wrap; }
-    if (state.clauseCache[key]) { setTimeout(function () { done(state.clauseCache[key]); }, 0); return wrap; }
-    D.request("GET", "/api/documents/" + encodeURIComponent(c.doc_id) + "/clause?" + url).then(function (r) {
-      if (r.ok) { state.clauseCache[key] = r.data; }
-      done(r.ok ? r.data : null);
-    });
+    loadClause(c).then(done);
     return wrap;
   }
   function clinicRow(row) {
@@ -993,6 +1264,156 @@
     });
     if (row.access_note) { dl.appendChild(el("dt", { text: T("answer.alt_reason") })); dl.appendChild(el("dd", { text: row.access_note })); }
     return el("div", null, [el("p", { class: "source", text: T("sources.clinic_row") }), dl]);
+  }
+
+  // ---------- превью источника у ссылки (этап w17-preview) ----------
+  // Ссылка «Источник: [n] документ, п. …» в ответе, сноска [n] и строка списка «Источники» — гиперссылки: клик
+  // открывает шторку с фрагментом (как раньше), наведение мышью или фокус с клавиатуры — всплывающее превью:
+  // документ, пункт/страница, договор, проверенная цитата (Citation.quote) и, если загрузится, кусок полного текста
+  // пункта вокруг цитаты с подсветкой (loadClause: тот же API и кэш, что у шторки). Запрос — только когда превью
+  // показано (после PREVIEW_DELAY), не на каждое движение мыши. Ошибка загрузки — остаётся только цитата.
+  // На тач-экране первый тап показывает превью с кнопкой «Открыть источник», второй тап по ссылке — шторку.
+  // WCAG 1.4.13: превью закрывается по Esc, не исчезает, пока на нём мышь, не перекрывает ссылку.
+  var PREVIEW_DELAY = 250, PREVIEW_HIDE_DELAY = 200, PREVIEW_RADIUS = 220, PREVIEW_GAP = 6, PREVIEW_MARGIN = 8;
+  var pv = { node: null, trigger: null, showTimer: null, hideTimer: null, tap: false, token: 0, pointer: null };
+  function previewNode() {
+    if (pv.node) { return pv.node; }
+    pv.node = el("div", { id: "src-preview", class: "srcprev", hidden: true });
+    pv.node.addEventListener("pointerenter", function () { clearTimeout(pv.hideTimer); });
+    pv.node.addEventListener("pointerleave", function (e) { if (e.pointerType === "mouse" && !pv.tap) { schedulePreviewHide(); } });
+    pv.node.addEventListener("focusout", function (e) {
+      if (!pv.node.contains(e.relatedTarget) && e.relatedTarget !== pv.trigger) { schedulePreviewHide(); }
+    });
+    document.body.appendChild(pv.node);
+    return pv.node;
+  }
+  function previewOpen() { return !!(pv.node && !pv.node.hidden); }
+  // Ссылка на источник: кнопка (действие — открыть шторку), оформлена как гиперссылка; превью по наведению/фокусу.
+  function sourceLink(cls, c, sources, idx, attrs, children) {
+    var a = attrs || {};
+    a.type = "button"; a.class = cls;
+    a.on = { click: function (e) { sourceClick(e, b, c, sources, idx); } };
+    var b = el("button", a, children);
+    b.addEventListener("pointerdown", function (e) { pv.pointer = e.pointerType; });
+    b.addEventListener("pointerenter", function (e) { if (e.pointerType === "mouse") { schedulePreview(b, c, sources, idx); } });
+    b.addEventListener("pointerleave", function (e) { if (e.pointerType === "mouse" && pv.trigger === b && !pv.tap) { schedulePreviewHide(); } else if (e.pointerType === "mouse") { clearTimeout(pv.showTimer); } });
+    b.addEventListener("focus", function () {
+      // Только фокус с клавиатуры: при клике мышью фокус тоже приходит, но превью уже показано наведением.
+      var kb = false;
+      try { kb = b.matches(":focus-visible"); } catch (err) { kb = false; }
+      if (kb) { schedulePreview(b, c, sources, idx); }
+    });
+    b.addEventListener("blur", function (e) {
+      if (pv.trigger === b && !(pv.node && pv.node.contains(e.relatedTarget))) { schedulePreviewHide(); }
+    });
+    return b;
+  }
+  function sourceClick(e, b, c, sources, idx) {
+    var touch = pv.pointer === "touch" || pv.pointer === "pen";
+    pv.pointer = null;
+    // Тап: сначала превью; повторный тап по той же ссылке (или «Открыть источник») — шторка.
+    if (touch && !(previewOpen() && pv.trigger === b)) { e.preventDefault(); showPreview(b, c, sources, idx, true); return; }
+    hidePreview(false);
+    openSource(sources, idx, b);
+  }
+  function schedulePreview(b, c, sources, idx) {
+    clearTimeout(pv.hideTimer); clearTimeout(pv.showTimer);
+    if (previewOpen() && pv.trigger === b) { return; }
+    pv.showTimer = setTimeout(function () { showPreview(b, c, sources, idx, false); }, PREVIEW_DELAY);
+  }
+  function schedulePreviewHide() {
+    clearTimeout(pv.showTimer); clearTimeout(pv.hideTimer);
+    pv.hideTimer = setTimeout(function () { hidePreview(false); }, PREVIEW_HIDE_DELAY);
+  }
+  // refocus — вернуть фокус на ссылку (Esc, «Закрыть»), иначе — только если фокус был внутри превью.
+  function hidePreview(refocus) {
+    clearTimeout(pv.showTimer); clearTimeout(pv.hideTimer);
+    pv.token++;
+    if (!previewOpen()) { pv.trigger = null; return; }
+    var t = pv.trigger, inside = pv.node.contains(document.activeElement);
+    pv.node.hidden = true;
+    clear(pv.node);
+    if (t) { t.removeAttribute("aria-describedby"); t.removeAttribute("aria-expanded"); }
+    pv.trigger = null; pv.tap = false;
+    if (t && (refocus || inside) && document.body.contains(t)) { t.focus(); }
+  }
+  // Кусок текста пункта вокруг цитаты (±PREVIEW_RADIUS символов по границе слова), цитата — mark.
+  // Цитата в тексте не нашлась — null (тогда остаётся одна цитата).
+  function excerpt(text, quote, offsets) {
+    var r = findQuote(text, quote, offsets);
+    if (!r) { return null; }
+    var s = Math.max(0, r[0] - PREVIEW_RADIUS), e = Math.min(text.length, r[1] + PREVIEW_RADIUS);
+    if (s > 0) { var sp = text.indexOf(" ", s); if (sp >= 0 && sp < r[0]) { s = sp + 1; } }
+    if (e < text.length) { var sp2 = text.lastIndexOf(" ", e); if (sp2 > r[1]) { e = sp2; } }
+    return el("div", { class: "quote srcprev__ctx" }, [
+      (s > 0 ? "…" : "") + text.slice(s, r[0]), el("mark", { text: text.slice(r[0], r[1]) }), text.slice(r[1], e) + (e < text.length ? "…" : "")
+    ]);
+  }
+  function showPreview(b, c, sources, idx, tap) {
+    if (!document.body.contains(b)) { return; }
+    hidePreview(false);
+    var node = previewNode(), tok = ++pv.token, where = citeWhere(c);
+    pv.trigger = b; pv.tap = tap;
+    // Наведение/фокус — подсказка (role="tooltip", у ссылки aria-describedby); тап — немодальный диалог с кнопками.
+    node.setAttribute("role", tap ? "dialog" : "tooltip");
+    if (tap) { node.setAttribute("aria-label", T("preview.label")); } else { node.removeAttribute("aria-label"); }
+    var ctr = c.contract_id ? T("answer.source_contract", { name: contractName(c.contract_id) }) : "";
+    var quoteBox = el("blockquote", { class: "srcprev__quote" }, ["«" + shorten(c.quote, 400) + "»"]);
+    var ctxBox = el("div", { class: "srcprev__ctxbox" }, [el("p", { class: "srcprev__loading", text: T("preview.loading") })]);
+    node.appendChild(el("p", { class: "srcprev__doc" }, [el("span", { class: "cite", text: "[" + (idx + 1) + "]" }), " ", docTitle(c)]));
+    var meta = [where, ctr].filter(Boolean).join(" · ");
+    if (meta) { node.appendChild(el("p", { class: "srcprev__meta", text: meta })); }
+    node.appendChild(el("p", { class: "srcprev__status" }, [c.verified === false
+      ? D.chip(T("sources.not_verified"), "chip--warn chip--bang") : D.chip(T("preview.verified"), "chip--ok")]));
+    node.appendChild(quoteBox);
+    node.appendChild(ctxBox);
+    if (tap) {
+      node.appendChild(el("p", { class: "srcprev__actions" }, [
+        el("button", { type: "button", class: "btn btn--small btn--primary", text: T("preview.open"), on: { click: function () { hidePreview(false); openSource(sources, idx, b); } } }),
+        el("button", { type: "button", class: "btn btn--small", text: T("preview.close"), on: { click: function () { hidePreview(true); } } })
+      ]));
+      b.setAttribute("aria-expanded", "true");
+    } else {
+      node.appendChild(el("p", { class: "srcprev__hint", text: T("preview.hint") }));
+      b.setAttribute("aria-describedby", "src-preview");
+    }
+    node.hidden = false;
+    placePreview();
+    // Полный текст пункта — лениво: тот же кэш, что у шторки; превью закрылось или сменилось — результат не показываем.
+    loadClause(c).then(function (data) {
+      if (tok !== pv.token) { return; }
+      clear(ctxBox);
+      var ex = null;
+      if (data && data.clause) {
+        var ct = clauseText(data.clause, c);
+        ex = excerpt(ct.text, cleanText(c.quote), ct.offsets);
+      }
+      if (ex) {
+        // Цитата нашлась в тексте пункта — показываем её в контексте (подсветка), отдельный блок цитаты не нужен.
+        quoteBox.hidden = true;
+        ctxBox.appendChild(el("p", { class: "srcprev__k", text: T("preview.context") }));
+        ctxBox.appendChild(ex);
+      }
+      placePreview();
+    });
+  }
+  // Позиция: под ссылкой, по её левому краю; не влезает вниз — над ссылкой; не влезает вправо — по правому краю ссылки.
+  function placePreview() {
+    if (!previewOpen() || !pv.trigger) { return; }
+    var node = pv.node, r = pv.trigger.getBoundingClientRect();
+    var vw = document.documentElement.clientWidth, vh = window.innerHeight, M = PREVIEW_MARGIN, G = PREVIEW_GAP;
+    node.style.maxHeight = "none";
+    var w = node.offsetWidth, h = node.offsetHeight;
+    var below = vh - r.bottom - G - M, above = r.top - G - M;
+    var up = h > below && above > below;
+    var room = Math.max(120, up ? above : below);
+    node.style.maxHeight = room + "px";
+    h = Math.min(h, room);
+    node.style.top = Math.round(up ? r.top - G - h : r.bottom + G) + "px";
+    var left = r.left;
+    if (left + w > vw - M) { left = r.right - w; }
+    node.style.left = Math.round(Math.max(M, Math.min(left, vw - M - w))) + "px";
+    node.classList.toggle("is-up", up);
   }
 
   // ---------- автоматизация: добавление клиники (ТЗ п. 5.2.2, ADR 0004) ----------
@@ -1132,6 +1553,32 @@
     return card(T("drafts.title"), [tablist, panels], "drafts-card");
   }
   function draftText(subject, body) { return subject + "\n\n" + body; }
+  // ---------- письмо из ответа ----------
+  // msgIdx — номер сообщения в обращении; серверу нужен номер ответа среди ответов по документам.
+  function openLetter(to, msgIdx) {
+    var q = state.req; if (!q) { return; }
+    var n = (q.messages || []).slice(0, msgIdx + 1).filter(function (m) { return m.answer && !(m.answer.reply && m.answer.reply.service); }).length - 1;
+    D.request("POST", "/api/requests/" + encodeURIComponent(q.id) + "/letter", { to: to, message: n < 0 ? null : n }).then(function (r) {
+      if (!r.ok) { showAlert(D.errorText(r)); return; }
+      state.letter = r.data;
+      $("letter-h").textContent = T(to === "hr" ? "letters.title_hr" : "letters.title_insurer");
+      $("letter-subject").value = r.data.subject; $("letter-body").value = r.data.body;
+      $("letter-status").textContent = r.data.unknown_fields.length ? T("letters.unfilled", { n: r.data.unknown_fields.length }) : "";
+      var dlg = $("letter-dlg");
+      if (typeof dlg.showModal === "function") { dlg.showModal(); } else { dlg.setAttribute("open", ""); }
+      $("letter-body").focus();
+    });
+  }
+  // Перед копированием и «Открыть в почте» — проверка текста после правки: обещание — не даём, «[ЗАПОЛНИТЬ]» — предупреждаем.
+  function checkLetter() {
+    var subj = $("letter-subject").value, body = $("letter-body").value, st = $("letter-status");
+    return D.request("POST", "/api/letters/check", { subject: subj, body: body, template: state.letter && state.letter.template }).then(function (r) {
+      if (!r.ok) { st.textContent = D.errorText(r); return false; }
+      if (r.data.promises.length) { st.textContent = T("letters.promises", { phrases: r.data.promises.join(", ") }); return false; }
+      st.textContent = r.data.unfilled ? T("letters.unfilled", { n: r.data.unfilled }) : "";
+      return true;
+    });
+  }
   function draftCard(d) {
     var sid = "ds-" + d.id, bid = "db-" + d.id;
     var subj = el("input", { type: "text", id: sid, value: d.subject, maxlength: "300" });
@@ -1157,7 +1604,7 @@
     } } });
     var mail = el("button", { type: "button", class: "btn btn--small", text: T("drafts.mail"), "aria-describedby": "mh-" + d.id,
       on: { click: function () { openMail(subj.value, body.value); } } });
-    var unknown = (d.unknown_fields || []).length ? el("p", { class: "draft__unknown" }, [D.chip(T("drafts.unknown", { fields: d.unknown_fields.join(", ") }), "chip--warn chip--bang")]) : null;
+    var unknown = (d.unknown_fields || []).length ? el("p", { class: "draft__unknown" }, [D.chip(T("drafts.unknown", { fields: d.unknown_fields.map(function (f) { var t = fieldName(f); return /^.[\u0430-\u044f\u0451]/.test(t) ? t.charAt(0).toLowerCase() + t.slice(1) : t; }).join(", ") }), "chip--warn chip--bang")]) : null;
     var flagged = promiseNotes(d);
     return el("article", { class: "draft" }, [
       el("div", { class: "draft__bar" }, [el("strong", { text: T("drafts.not_sent") }), el("span", { text: T("drafts.stage", { name: T("automation.states." + d.stage) }) }),
@@ -1172,6 +1619,8 @@
       ])
     ]);
   }
+  // Имя поля шаблона письма (address, clinic…) — по-русски из automation.field_names; неизвестное — как есть.
+  function fieldName(f) { var t = T("automation.field_names." + f); return t === "automation.field_names." + f ? f : t; }
   // Поля письма, очищенные автоматом из-за обещания в подставленном тексте (history.promise_fields).
   function promiseNotes(d) {
     var auto = state.req && state.req.automation, notes = [];
@@ -1179,7 +1628,7 @@
       ((h && h.promise_fields) || []).forEach(function (f) {
         if (f.draft !== d.id) { return; }
         notes.push(el("p", { class: "draft__unknown" }, [D.chip(T("automation.promise_field", {
-          field: T("automation.field_names." + f.field), phrases: (f.phrases || []).join("; ") }), "chip--warn chip--bang")]));
+          field: fieldName(f.field), phrases: (f.phrases || []).join("; ") }), "chip--warn chip--bang")]));
       });
     });
     return notes.length ? el("div", null, notes) : null;
@@ -1219,15 +1668,35 @@
     if (answeredReq(q)) { items.push(["menu_rate", function () { state.rateOpen = true; renderRequest(); focusAfter([".rate input:checked", ".rate input"]); }]); }
     var la = lastAnswerOf(q), laSources = la ? orderedSources(la) : [];
     if (laSources.length) { items.push(["menu_sources", function () { openSource(laSources, null, $("chat-menu-btn")); }]); }
-    if (answeredReq(q) && q.status !== "closed" && !q.automation && !(la && la.suggested_automation) && !state.offerOpen) {
+    if (answeredReq(q) && q.status !== "closed" && !q.automation && !(la && la.suggested_automation) && !state.offerOpen && !state.att.active) {
       items.push(["menu_add_clinic", function () { state.offerOpen = true; renderRequest(); focusAfter([".offer input"]); }]);
     }
     items.push([$("show-closed").checked ? "menu_closed_off" : "menu_closed_on", function () {
       var c = $("show-closed"); c.checked = !c.checked; loadRequests().then(renderRequest);
     }]);
+    items.push(["attach.menu", openAttList]);
+    items.push(["menu_delete_chat", deleteChat]);
     items.forEach(function (it) {
-      ul.appendChild(el("li", null, [el("button", { type: "button", class: "menu__item", text: T("chat." + it[0]),
+      var label = it[0].indexOf(".") > 0 ? T("attach.menu") : T("chat." + it[0]);
+      ul.appendChild(el("li", null, [el("button", { type: "button", class: "menu__item" + (it[0] === "menu_delete_chat" ? " menu__item--danger" : ""), text: label,
         on: { click: function () { closeMenu(false); it[1](); } } })]));
+    });
+  }
+  // Удалить чат целиком (обращения, черновики, вложения) — после подтверждения; затем — экран без выбранного чата.
+  function deleteChat() {
+    var c = state.chat;
+    if (!c || !window.confirm(T("chat.delete_confirm", { title: chatTitle(c) }))) { return; }
+    D.request("DELETE", "/api/chats/" + encodeURIComponent(c.id)).then(function (r) {
+      if (!r.ok) { showAlert(D.errorText(r)); return; }
+      var title = chatTitle(c);   // до удаления из списка: номер «· № 2» считается по соседям
+      state.chats = state.chats.filter(function (x) { return x.id !== c.id; });
+      state.chat = null; state.req = null; state.requests = []; state.sources = []; state.sourceSel = null;
+      state.att = { items: [], active: null };
+      D.writeHash({ chat: null, req: null });
+      renderChats(); renderHead(); renderSources(); renderAttBar(); renderRequests(); renderRequest();
+      setAskEnabled(true);
+      $("announce").textContent = T("chat.deleted", { title: title });
+      $("new-chat-btn").focus();
     });
   }
   function openMenu() {
@@ -1270,7 +1739,45 @@
         el("button", { type: "button", id: "req-reopen", class: "btn btn--small", text: T("chat.reopen_request"), on: { click: function () { toggleRequest(q); } } })]));
     }
     if (state.rateOpen && answeredReq(q)) { out.appendChild(rateBox(q)); }
+    if (!closed && answeredReq(q)) { var fb = factsBar(q); if (fb) { out.appendChild(fb); } }
     return out;
+  }
+  // Карточка фактов обращения: что ассистент знает об этом случае (факты копятся по обращению — Request.slots, и
+  // программа чата). Факт можно изменить: ответ уходит как уточнение (clarify) и склеивается с исходным вопросом;
+  // вопросы — те же формулировки, что в «Что уточнить» (ui.yaml chat.facts), поэтому отвеченное не спрашивается снова.
+  function factsBar(q) {
+    var sl = q.slots || {}, ctx = (state.chat && state.chat.context) || {}, items = [];
+    function add(key, value, question, opts, editable) { if (value) { items.push({ key: key, value: value, question: question, opts: opts || [], edit: editable }); } }
+    add("service", sl.service || sl.care_type, null, null, false);
+    add("clinic", sl.clinic, T("chat.facts.q_clinic"), null, true);
+    add("program", ctx.program || sl.program, T("chat.facts.q_program"), null, !ctx.program);
+    add("fact_mode", sl.fact_mode ? T("chat.facts.mode." + sl.fact_mode) : null, T("chat.facts.q_mode"),
+      [T("chat.facts.opt_emergency"), T("chat.facts.opt_planned")], true);
+    add("fact_referral", sl.fact_referral ? T("chat.facts.referral." + sl.fact_referral) : null, T("chat.facts.q_referral"),
+      [T("reply.yes"), T("reply.no")], true);
+    if (!items.length) { return null; }
+    var bar = el("div", { class: "facts", role: "group", "aria-label": T("chat.facts.title") }, [el("span", { class: "facts__t", text: T("chat.facts.title") })]);
+    items.forEach(function (it) {
+      var chip = el("span", { class: "facts__chip" }, [el("span", { class: "facts__k", text: T("chat.facts." + it.key) + ": " }), el("span", { class: "facts__v", text: it.value })]);
+      if (it.edit && state.req && state.req.status !== "closed") {
+        chip.appendChild(el("button", { type: "button", class: "facts__edit", title: T("chat.facts.edit"), "aria-label": T("chat.facts.edit") + ": " + T("chat.facts." + it.key),
+          text: "\u270E", on: { click: function () { editFact(bar, it); } } }));
+      }
+      bar.appendChild(chip);
+    });
+    return bar;
+  }
+  function editFact(bar, it) {
+    var old = bar.querySelector(".facts__form"); if (old) { old.remove(); }
+    var input = el("input", { type: "text", class: "clar__input", maxlength: "300", placeholder: T("reply.clarify_own"), "aria-label": it.question });
+    var form = el("form", { class: "facts__form clar__own", novalidate: true, on: { submit: function (e) {
+      e.preventDefault(); var v = input.value.trim(); if (!v) { input.focus(); return; } ask(v, it.question);
+    } } }, [input, el("button", { type: "submit", class: "btn btn--small btn--primary", text: T("reply.clarify_send") })]);
+    var row = el("div", { class: "facts__form-row" }, it.opts.map(function (o) {
+      return el("button", { type: "button", class: "reply__opt", text: o, on: { click: function () { ask(o, it.question); } } });
+    }).concat([form]));
+    bar.appendChild(el("div", { class: "facts__form-wrap" }, [el("p", { class: "clar__q", text: it.question }), row]));
+    (it.opts.length ? row.querySelector(".reply__opt") : input).focus();
   }
   function rateBox(q) {
     var stars = el("div", { class: "seg__row stars" });
@@ -1305,12 +1812,168 @@
     ]);
   }
 
+  // ---------- документ в чат (ADR 0016): кнопка «Прикрепить», перетаскивание, плашка «По документу», «Вложения» ----------
+  // Вложение принадлежит чату (в других чатах не видно). Пока активно — вопросы чата сервер отвечает по нему
+  // (answer_message → attachment.answer); ✕ на плашке — снова по договору чата. Настройка «также в документы
+  // договора» (GET /api/settings) — диалог с выбором договора (в чате ГК) и типа документа.
+  var ATT_TYPES = ["program", "contract", "amendment", "memo", "other"];
+  function isAttachmentId(id) { return String(id || "").indexOf("att_") === 0; }
+  function byAttachment(a) { return collectSources(a).some(function (c) { return isAttachmentId(c.doc_id); }); }
+  function activeAttachment() {
+    var id = state.att.active;
+    return id ? state.att.items.filter(function (x) { return x.id === id; })[0] || null : null;
+  }
+  function loadAttachments() {
+    if (!state.chat) { state.att = { items: [], active: null }; renderAttBar(); return Promise.resolve(); }
+    var chatId = state.chat.id;
+    return D.request("GET", "/api/chats/" + encodeURIComponent(chatId) + "/attachments").then(function (r) {
+      if (!state.chat || state.chat.id !== chatId) { return; }
+      state.att = r.ok && r.data ? { items: r.data.items || [], active: r.data.active || null } : { items: [], active: null };
+      (state.att.items || []).forEach(function (x) { if (x.id && x.title) { state.docTitles[x.id] = x.title; } });
+      renderAttBar(); renderMenu();
+    });
+  }
+  function renderAttBar() {
+    var a = activeAttachment(), bar = $("attbar");
+    bar.hidden = !a;
+    $("attbar-name").textContent = a ? a.title : "";
+    $("attach-btn").disabled = !state.chat || state.busy;
+  }
+  function setActiveAttachment(id) {
+    if (!state.chat) { return Promise.resolve(); }
+    return D.request("PUT", "/api/chats/" + encodeURIComponent(state.chat.id) + "/attachments/active", { attachment_id: id }).then(function (r) {
+      if (!r.ok) { showAlert(D.errorText(r)); return; }
+      state.att = { items: r.data.items || [], active: r.data.active || null };
+      renderAttBar(); renderMenu();
+      if ($("att-list-dlg").open) { renderAttList(); }
+    });
+  }
+  function pickFile() {
+    if (state.busy) { return; }
+    if (!state.chat) { state.pending = { attach: true }; openNewChat(); return; }
+    var inp = $("attach-input"); inp.value = ""; inp.click();
+  }
+  // Файл выбран или брошен в чат: при настройке «только в этом чате» — сразу загрузка, иначе — диалог договора и типа.
+  function handleFile(file) {
+    if (!file || !state.chat || state.busy) { return; }
+    D.request("GET", "/api/settings").then(function (r) {
+      var toContract = r.ok && r.data && r.data.chat_upload_target === "contract";
+      if (toContract) { openAttDialog(file); } else { uploadFile(file, {}); }
+    });
+  }
+  function openAttDialog(file) {
+    state.attFile = file;
+    $("att-file").textContent = file.name;
+    var ctx = state.chat.context || {}, sel = $("att-contract"), types = $("att-type");
+    clear(sel); clear(types);
+    var ids = ctx.contract_id ? [ctx.contract_id] : ((state.groupById[ctx.group_id] || {}).contracts || []).map(function (c) { return c.id; });
+    if (!ctx.contract_id) { sel.appendChild(el("option", { value: "", text: T("attach.dlg_contract_pick") })); }
+    ids.forEach(function (id) { sel.appendChild(el("option", { value: id, text: contractName(id) })); });
+    sel.disabled = !!ctx.contract_id;
+    types.appendChild(el("option", { value: "", text: T("attach.dlg_type_auto") }));
+    ATT_TYPES.forEach(function (t) { types.appendChild(el("option", { value: t, text: T("attach.types." + t) })); });
+    var al = $("att-alert"); al.hidden = true; al.textContent = "";
+    var dlg = $("att-dlg");
+    if (dlg.showModal) { dlg.showModal(); } else { dlg.setAttribute("open", ""); }
+    (sel.disabled ? types : sel).focus();
+  }
+  function closeAttDialog() { var dlg = $("att-dlg"); if (dlg.close) { dlg.close(); } else { dlg.removeAttribute("open"); } $("attach-btn").focus(); }
+  function sendAttDialog(e) {
+    e.preventDefault();
+    var ctx = state.chat.context || {}, cid = $("att-contract").value;
+    if (!ctx.contract_id && !cid) { var al = $("att-alert"); al.textContent = T("attach.dlg_contract_pick"); al.hidden = false; $("att-contract").focus(); return; }
+    var file = state.attFile; state.attFile = null;
+    closeAttDialog();
+    uploadFile(file, { contract_id: ctx.contract_id ? "" : cid, doc_type: $("att-type").value });
+  }
+  function uploadFile(file, extra) {
+    if (!file || !state.chat) { return; }
+    state.busy = true; setAskEnabled(false); showAlert("");
+    var fd = new FormData();
+    fd.append("file", file, file.name);
+    if (state.req && state.req.status !== "closed") { fd.append("request_id", state.req.id); }
+    Object.keys(extra || {}).forEach(function (k) { if (extra[k]) { fd.append(k, extra[k]); } });
+    var box = $("messages"), intro = box.querySelector(".intro"); if (intro) { box.removeChild(intro); }
+    var prog = progressNode(); prog.label.textContent = T("attach.uploading", { name: file.name });
+    box.appendChild(prog.node); box.scrollTop = box.scrollHeight;
+    var chatId = state.chat.id;
+    D.request("POST", "/api/chats/" + encodeURIComponent(chatId) + "/attachments", fd).then(function (r) {
+      if (prog.node.parentNode) { prog.node.parentNode.removeChild(prog.node); }
+      state.busy = false;
+      if (!r.ok) { setAskEnabled(true); renderAttBar(); showAlert(D.errorText(r)); return; }
+      if (!state.chat || state.chat.id !== chatId) { return; }
+      var att = r.data.attachment || {};
+      if (att.id && att.title) { state.docTitles[att.id] = att.title; }
+      return Promise.all([loadAttachments(), loadRequests()]).then(function () {
+        selectRequest(r.data.request_id);
+        announceLast();
+        if (!$("question").disabled) { $("question").focus(); }
+      });
+    });
+  }
+  function openAttList() {
+    renderAttList();
+    var dlg = $("att-list-dlg");
+    if (dlg.showModal) { dlg.showModal(); } else { dlg.setAttribute("open", ""); }
+    var b = dlg.querySelector(".attlist button") || $("att-list-close"); b.focus();
+  }
+  function closeAttList() { var dlg = $("att-list-dlg"); if (dlg.close) { dlg.close(); } else { dlg.removeAttribute("open"); } $("chat-menu-btn").focus(); }
+  function renderAttList() {
+    var ul = $("att-list");
+    clear(ul);
+    if (!state.att.items.length) { ul.appendChild(el("li", { class: "muted", text: T("attach.list_empty") })); return; }
+    state.att.items.slice().reverse().forEach(function (x) {
+      var on = x.id === state.att.active;
+      ul.appendChild(el("li", { class: "attlist__item" + (on ? " is-active" : "") }, [
+        el("div", { class: "attlist__main" }, [
+          el("strong", { class: "attlist__title", text: x.title }),
+          el("span", { class: "attlist__meta", text: [String(x.format || "").toUpperCase(), T("attach.clauses_n", { n: x.clauses || 0 }),
+            x.uploaded_at ? D.fmtDateTime(x.uploaded_at) : ""].filter(Boolean).join(" · ") }),
+          x.added_to ? el("span", { class: "attlist__meta", text: T("attach.added", { contract: contractName(x.added_to) }) }) : null
+        ]),
+        el("div", { class: "attlist__act" }, [
+          on ? D.chip(T("attach.active"), "chip--ok") : null,
+          el("button", { type: "button", class: "btn btn--small" + (on ? "" : " btn--primary"), text: T(on ? "attach.use_off" : "attach.use"),
+            on: { click: function () { setActiveAttachment(on ? null : x.id); } } }),
+          el("button", { type: "button", class: "btn btn--small", text: T("attach.delete"),
+            "aria-label": T("attach.delete_aria", { name: x.title }), on: { click: function () { deleteAttachment(x); } } })
+        ])
+      ]));
+    });
+  }
+  // Удаление вложения: подтверждение, затем список и плашка «По документу» перерисовываются; документ, добавленный к
+  // договору, у договора остаётся (сообщение об этом — после удаления).
+  function deleteAttachment(x) {
+    if (!window.confirm(T(x.added_to ? "attach.delete_confirm_added" : "attach.delete_confirm", { name: x.title }))) { return; }
+    D.request("DELETE", "/api/chats/" + encodeURIComponent(state.chat.id) + "/attachments/" + encodeURIComponent(x.id)).then(function (r) {
+      if (!r.ok) { showAlert(D.errorText(r)); return; }
+      state.att = { items: r.data.items || [], active: r.data.active || null };
+      renderAttList(); renderAttBar(); renderMenu();
+    });
+  }
+  // Перетаскивание файла в чат: подсветка зоны, первый файл — как по кнопке «Прикрепить».
+  function wireDrop() {
+    var zone = document.querySelector(".chat"), mark = $("dropzone"), depth = 0;
+    function hasFiles(e) { return !!(e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], "Files") >= 0); }
+    zone.addEventListener("dragenter", function (e) { if (!hasFiles(e) || !state.chat) { return; } e.preventDefault(); depth += 1; mark.hidden = false; });
+    zone.addEventListener("dragover", function (e) { if (!hasFiles(e) || !state.chat) { return; } e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
+    zone.addEventListener("dragleave", function () { depth = Math.max(0, depth - 1); if (!depth) { mark.hidden = true; } });
+    zone.addEventListener("drop", function (e) {
+      if (!hasFiles(e)) { return; }
+      e.preventDefault(); depth = 0; mark.hidden = true;
+      var f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) { handleFile(f); }
+    });
+  }
+
   // ---------- вопрос и индикатор «печатает…» ----------
   function setAskEnabled(on) {
     var t = $("question"), b = $("ask-btn");
     var closed = state.req && state.req.status === "closed";
-    t.disabled = !on || state.busy || !state.chat;
+    // без выбранного чата поле и кнопки работают: отправка или «Прикрепить» открывают выбор договора (pendingAsk)
+    t.disabled = !on || state.busy;
     b.disabled = t.disabled;
+    $("attach-btn").disabled = state.busy;
     $("ask-hint").textContent = closed ? T("chat.request_closed_hint") : T("chat.ask_hint");
   }
   // Пузырь «печатает…»: три точки и одна короткая строка по стадии SSE (route → «Читаю вопрос…», contract →
@@ -1319,12 +1982,30 @@
     var label = el("span", { class: "typing__text", text: T("chat.typing.start") });
     var node = el("div", { class: "msg msg--bot typing progress", role: "status", "aria-label": T("chat.typing_aria") }, [
       el("span", { class: "typing__dots", "aria-hidden": "true" }, [el("span"), el("span"), el("span")]), label]);
-    return { node: node, stage: function (data) {
+    return { node: node, label: label, stage: function (data) {
       var name = data && typeof data === "object" ? (data.stage || data.name || "") : data;
       name = String(name || "").split(/[\s:_-]/)[0];
       var t = T("chat.typing." + name);
       label.textContent = t === "chat.typing." + name ? T("chat.typing.other") : t;
     } };
+  }
+  // Счётчик символов вопроса (ревизия w16): поле обрезает ввод по maxlength молча — с INPUT_WARN символов
+  // показываем «N из 4000», на пределе — подсказку; вставка длиннее предела — отдельное предупреждение.
+  var INPUT_WARN = 3500;
+  function inputMax() { var t = $("question"); return t.maxLength > 0 ? t.maxLength : 4000; }
+  function countInput(cut) {
+    var t = $("question"), c = $("ask-count"), n = t.value.length, max = inputMax();
+    if (!c) { return; }
+    var show = cut || n >= INPUT_WARN;
+    c.hidden = !show;
+    c.classList.toggle("ask__count--max", !!cut || n >= max);
+    c.textContent = !show ? "" : cut ? T("chat.input_cut", { max: max }) : n >= max ? T("chat.input_limit", { max: max }) : T("chat.input_count", { n: n, max: max });
+  }
+  function onPaste(e) {
+    var t = $("question"), data = e.clipboardData && e.clipboardData.getData("text");
+    if (!data) { return; }
+    var room = inputMax() - (t.value.length - (t.selectionEnd - t.selectionStart));
+    if (data.length > room) { setTimeout(function () { countInput(true); }, 0); }
   }
   // Поле ввода растёт по тексту до 6 строк (дальше — прокрутка внутри поля).
   function autoGrow() {
@@ -1340,10 +2021,13 @@
     var v = vk ? T("reply.verdict." + vk) : (!a.reply && a.label ? T("labels." + a.label) : "");
     $("announce").textContent = T("chat.new_answer", { text: [v, a.reply ? a.reply.lead : a.summary].filter(Boolean).join(": ") });
   }
-  function ask(text) {
+  // clarify — вопрос из «Что уточнить», на который это ответ (сервер склеит ответ с исходным вопросом)
+  function ask(text, clarify) {
     text = (text || "").trim();
     if (!text) { showAlert(T("errors.empty_question")); $("question").focus(); return Promise.resolve(); }
-    if (!state.chat || state.busy) { return Promise.resolve(); }
+    // чат не выбран: сначала выбор договора или группы, после создания чата вопрос уйдёт сам (createChat)
+    if (!state.chat) { state.pending = { text: text, clarify: clarify || null }; openNewChat(); return Promise.resolve(); }
+    if (state.busy) { return Promise.resolve(); }
     state.busy = true; setAskEnabled(false); showAlert("");
     var ensure = state.req && state.req.status !== "closed" ? Promise.resolve({ ok: true, data: state.req })
       : D.request("POST", "/api/chats/" + encodeURIComponent(state.chat.id) + "/requests", { title: text.length > 80 ? shorten(text, 79) : text });
@@ -1355,12 +2039,12 @@
       }
       var box = $("messages");
       var intro = box.querySelector(".intro"); if (intro) { box.removeChild(intro); }
-      box.appendChild(userBubble(text, new Date().toISOString()));
+      box.appendChild(userBubble(clarify ? clarify + " — " + text : text, new Date().toISOString()));
       var prog = progressNode();
       box.appendChild(prog.node);
       box.scrollTop = box.scrollHeight;
-      $("question").value = ""; autoGrow();
-      return D.postStream("/api/requests/" + encodeURIComponent(state.req.id) + "/messages", { text: text }, prog.stage).then(function (res) {
+      if (!clarify) { $("question").value = ""; autoGrow(); countInput(); }
+      return D.postStream("/api/requests/" + encodeURIComponent(state.req.id) + "/messages", clarify ? { text: text, clarify: clarify } : { text: text }, prog.stage).then(function (res) {
         if (prog.node.parentNode) { prog.node.parentNode.removeChild(prog.node); }
         if (!res.ok) { throw { res: res, text: text }; }
         state.sources = []; state.sourceSel = null;
@@ -1372,8 +2056,8 @@
       var p = $("messages").querySelector(".progress"); if (p) { p.parentNode.removeChild(p); }
       state.busy = false;
       if (state.req) { renderRequest(); }   // убрать неотправленную реплику: история — только то, что сохранил сервер
-      showAlert(D.errorText(res), function () { showAlert(""); ask(err && err.text ? err.text : text); });
-      $("question").value = text; autoGrow();
+      showAlert(D.errorText(res), function () { showAlert(""); ask(err && err.text ? err.text : text, clarify); });
+      if (!clarify) { $("question").value = text; autoGrow(); countInput(); }
     }).then(function () {
       state.busy = false; setAskEnabled(!(state.req && state.req.status === "closed"));
       if (!$("question").disabled) { $("question").focus(); }
@@ -1393,6 +2077,8 @@
       clear(list);
       state.examples = r.ok ? (r.data || []) : [];
       $("examples-n").textContent = "(" + state.examples.length + ")";
+      // 0 примеров — кнопка «Примеры вопросов (0)» не показывается (ревизия w16).
+      $("examples-btn").hidden = !state.examples.length;
       if (!state.examples.length) { list.appendChild(el("li", { class: "muted", text: T("chat.examples_empty") })); return; }
       state.examples.forEach(function (ex, i) {
         list.appendChild(el("li", null, [el("button", { type: "button", class: "ex", on: { click: function () { toggleExamples(false); runExample(ex); } } }, [
@@ -1415,8 +2101,10 @@
       if (!r.ok) { throw r; }
       state.chats.unshift(r.data); return r.data;
     });
+    // Пример открывает чат своего договора и ставит вопрос в поле ввода — отправляет менеджер сам (ревью сайта
+    // 29.10.2026: раньше вопрос уходил сразу, и ответ приходил по договору, который менеджер не выбирал).
     p.then(function (chat) {
-      return selectChat(chat.id).then(function () { state.req = null; renderRequests(); return ask(ex.question); });
+      return selectChat(chat.id).then(function () { state.req = null; renderRequests(); renderRequest(); useQuestion(ex.question); });
     }).catch(function (r) { showAlert(D.errorText(r)); });
   }
 
@@ -1439,14 +2127,18 @@
     $("nc-contract-none").hidden = n > 0;
     fillPrograms();
   }
-  function fillPrograms() {
-    var dl = $("nc-programs"), names = {};
-    clear(dl);
-    var contracts = [];
+  // Программы выбранного в диалоге договора или группы (подсказки поля «Программа» и проверка при создании чата).
+  function dialogPrograms() {
+    var names = {}, contracts = [];
     if (kind() === "group") { var g = state.groupById[$("nc-group").value]; contracts = g ? g.contracts || [] : []; }
     else if (state.contractById[$("nc-contract").value]) { contracts = [state.contractById[$("nc-contract").value]]; }
     contracts.forEach(function (c) { (c.programs || []).forEach(function (p) { names[typeof p === "string" ? p : p.name] = true; }); });
-    Object.keys(names).sort().forEach(function (p) { dl.appendChild(el("option", { value: p })); });
+    return Object.keys(names).sort();
+  }
+  function fillPrograms() {
+    var dl = $("nc-programs");
+    clear(dl);
+    dialogPrograms().forEach(function (p) { dl.appendChild(el("option", { value: p })); });
   }
   function openNewChat() {
     var gs = $("nc-group");
@@ -1454,6 +2146,9 @@
     state.groups.forEach(function (g) { gs.appendChild(el("option", { value: g.id, text: g.name })); });
     $("nc-search").value = ""; $("nc-program").value = ""; $("nc-title").value = ""; $("nc-date").value = D.todayIso();
     $("nc-alert").hidden = true;
+    var pend = $("nc-pending");
+    pend.hidden = !state.pending;
+    pend.textContent = state.pending ? T(state.pending.attach ? "new_chat.pending_attach" : "new_chat.pending_question") : "";
     fillContracts(); syncKind();
     var dlg = $("new-chat-dlg");
     if (typeof dlg.showModal === "function") { dlg.showModal(); } else { dlg.setAttribute("open", ""); }
@@ -1475,20 +2170,48 @@
     }
     var al = $("nc-alert");
     if (!ctx.group_id && !ctx.contract_id) { al.textContent = T("errors.choose_context"); al.hidden = false; return; }
+    // программы нет ни в договоре, ни в группе — иначе ассистент спрашивал бы её снова в каждом ответе
+    if (ctx.program) {
+      var known = dialogPrograms(), want = ctx.program.toLowerCase().replace(/\s+/g, " ");
+      var hit = known.filter(function (p) { return p.toLowerCase().replace(/\s+/g, " ") === want; })[0];
+      if (known.length && !hit) { al.textContent = T("new_chat.program_unknown", { program: ctx.program }); al.hidden = false; $("nc-program").focus(); return; }
+      if (hit) { ctx.program = hit; }
+    }
     $("nc-create").disabled = true;
     D.request("POST", "/api/chats", { context: ctx, title: $("nc-title").value.trim() || null }).then(function (r) {
       $("nc-create").disabled = false;
       if (!r.ok) { al.textContent = D.errorText(r); al.hidden = false; return; }
       state.chats.unshift(r.data);
+      var pending = state.pending; state.pending = null;
       closeNewChat();
-      selectChat(r.data.id);
+      // Фокус — в поле вопроса: следующий шаг после создания чата — вопрос (ревизия w16). Вопрос, написанный до
+      // выбора договора, отправляется сразу; «Прикрепить» до выбора — открывается выбор файла.
+      selectChat(r.data.id).then(function () {
+        if (pending && pending.text) { return ask(pending.text, pending.clarify); }
+        if (pending && pending.attach) { pickFile(); return; }
+        if (!$("question").disabled) { $("question").focus(); }
+      });
     });
   }
 
   // ---------- запуск ----------
   function wire() {
     $("new-chat-btn").addEventListener("click", openNewChat);
-    $("nc-cancel").addEventListener("click", closeNewChat);
+    $("nc-cancel").addEventListener("click", function () { state.pending = null; closeNewChat(); });
+    $("letter-close").addEventListener("click", function () { var d = $("letter-dlg"); if (d.close) { d.close(); } else { d.removeAttribute("open"); } });
+    $("letter-copy").addEventListener("click", function () {
+      checkLetter().then(function (ok) {
+        if (!ok) { return; }
+        copyText(draftText($("letter-subject").value, $("letter-body").value), $("letter-body")).then(function (done) {
+          var st = $("letter-status"); st.textContent = (st.textContent ? st.textContent + " " : "") + T(done ? "letters.copied" : "errors.copy_failed");
+        });
+      });
+    });
+    $("letter-download").addEventListener("click", function () {
+      checkLetter().then(function (ok) { if (ok) { download(T("drafts.file_prefix") + "-" + (state.letter ? state.letter.to : "letter") + ".txt", draftText($("letter-subject").value, $("letter-body").value)); } });
+    });
+    // mailto: — только по клику (openMail на одной строке с обработчиком click — тест test_mailto_only_in_click_handler)
+    $("letter-mail").addEventListener("click", function () { checkLetter().then(function (ok) { if (ok) { openMail($("letter-subject").value, $("letter-body").value); } }); });
     $("new-chat-form").addEventListener("submit", createChat);
     Array.prototype.forEach.call(document.querySelectorAll('input[name="nc-kind"]'), function (r) { r.addEventListener("change", syncKind); });
     $("nc-search").addEventListener("input", fillContracts);
@@ -1502,7 +2225,8 @@
       if (e.key !== "Enter" || e.isComposing || e.shiftKey) { return; }
       e.preventDefault(); ask($("question").value);
     });
-    $("question").addEventListener("input", autoGrow);
+    $("question").addEventListener("input", function () { autoGrow(); countInput(); });
+    $("question").addEventListener("paste", onPaste);
     $("examples-btn").addEventListener("click", function () { toggleExamples(); });
     $("chat-menu-btn").addEventListener("click", function () { if (!closeMenu(false)) { openMenu(); } });
     $("chat-menu").addEventListener("keydown", menuKeys);
@@ -1515,12 +2239,28 @@
     $("sources-close").addEventListener("click", closeDrawer);
     $("sources-backdrop").addEventListener("click", closeDrawer);
     document.addEventListener("keydown", function (e) {
-      if (e.key !== "Escape" || $("new-chat-dlg").open) { return; }
+      if (e.key !== "Escape" || $("new-chat-dlg").open || $("att-dlg").open || $("att-list-dlg").open) { return; }
+      // Сначала закрывается превью источника (WCAG 1.4.13), шторка и прочее — следующим Esc.
+      if (previewOpen()) { e.preventDefault(); hidePreview(true); return; }
       if ($("sources").classList.contains("is-open")) { closeDrawer(); return; }
       if (!$("examples").hidden) { toggleExamples(false); $("examples-btn").focus(); return; }
       if (closeSide()) { $("side-toggle").focus(); }
     });
+    $("attach-btn").addEventListener("click", pickFile);
+    $("attach-input").addEventListener("change", function () { var f = this.files && this.files[0]; if (f) { handleFile(f); } });
+    $("attbar-off").addEventListener("click", function () { setActiveAttachment(null).then(function () { $("question").focus(); }); });
+    $("att-form").addEventListener("submit", sendAttDialog);
+    $("att-cancel").addEventListener("click", function () { state.attFile = null; closeAttDialog(); });
+    $("att-list-close").addEventListener("click", closeAttList);
+    wireDrop();
     window.addEventListener("hashchange", applyHash);
+    // Превью источника привязано к ссылке: прокрутка ленты или окна, смена размера — закрыть (кроме прокрутки
+    // внутри самого превью); тап или клик вне превью и ссылки — закрыть.
+    window.addEventListener("scroll", function (e) { if (previewOpen() && !pv.node.contains(e.target)) { hidePreview(false); } }, true);
+    window.addEventListener("resize", function () { hidePreview(false); });
+    document.addEventListener("pointerdown", function (e) {
+      if (previewOpen() && !pv.node.contains(e.target) && !(pv.trigger && pv.trigger.contains(e.target))) { hidePreview(false); }
+    });
   }
   // Чат занимает окно до низа: верх раскладки зависит от переносов шапки и плашки — меряем и кладём в --chat-top.
   function fitChat() {
@@ -1532,7 +2272,7 @@
     if (document.fonts && document.fonts.ready) { document.fonts.ready.then(fitChat); }
     window.addEventListener("resize", fitChat);
     wire();
-    setAskEnabled(false);
+    setAskEnabled(true);
     D.request("GET", "/api/groups").then(function (r) {
       indexGroups(r.ok ? r.data : []);
       if (!r.ok) { state.stickyError = { text: D.errorText(r), retry: function () { location.reload(); } }; showAlert(state.stickyError.text, state.stickyError.retry); }

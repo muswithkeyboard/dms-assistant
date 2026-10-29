@@ -62,8 +62,12 @@ def test_slow_answer_does_not_block_other_requests_and_slot_is_released():
     t0 = time.perf_counter()
     assert c.get("/api/groups").status_code == 200            # цикл событий свободен, пока идёт расчёт
     assert time.perf_counter() - t0 < 0.5
-    # второй тяжёлый запрос того же адреса — 503 «ваш предыдущий запрос ещё обрабатывается»
+    # тот же запрос — 409 «ассистент ещё отвечает» (ревью 29.10.2026 п. 5); другой запрос того же адреса —
+    # 503 «ваш предыдущий запрос ещё обрабатывается» (один тяжёлый расчёт на адрес)
     r = c.post(f"/api/requests/{rid}/messages", json={"text": "второй"})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "request_busy"
+    _, rid2 = new_request(c)
+    r = c.post(f"/api/requests/{rid2}/messages", json={"text": "второй"})
     assert r.status_code == 503 and "предыдущий" in r.json()["error"]["message"]
     t.join(5)
     assert out["r"].status_code == 200

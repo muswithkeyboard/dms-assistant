@@ -11,12 +11,16 @@ SYNONYM_WEIGHT — найденное по словам самого вопро�
 """
 from __future__ import annotations
 
+import threading
 import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from ..config import load_yaml
+from ..constants import CLAUSE_CACHE_MAX
 from ..schemas import Clause
+from ..store.cache import BoundedCache
 from ..store.db import KitStore, _require_contract_id, program_matches
 from .bm25 import BM25
 from .morph import lemmas
@@ -33,13 +37,24 @@ class ContractIndex:
     doc_types: dict[str, str] = field(default_factory=dict)     # doc_id → doc_type
 
 
-_CACHE: weakref.WeakKeyDictionary[KitStore, dict[str, ContractIndex]] = weakref.WeakKeyDictionary()
+_CACHE: weakref.WeakKeyDictionary[KitStore, BoundedCache[ContractIndex]] = weakref.WeakKeyDictionary()
+_LOCK = threading.Lock()
 
 
 def clause_terms(c: Clause) -> list[str]:
-    """Что индексируется у пункта: номер, путь, текст и сноски (сноски вклеены в пункт, docs/CONTRACTS.md §1)."""
-    parts = [c.number or "", c.path, c.text, *c.footnotes]
-    return lemmas(" ".join(p for p in parts if p))
+    """Что индексируется у пункта: номер, путь, текст и сноски (сноски вклеены в пункт, docs/CONTRACTS.md §1).
+    Леммы каждой части — из кэша по её тексту: одинаковые тексты и пути пунктов (договоры ГК совпадают на 87–99 %)
+    разбираются один раз (круг 2 ревизии w16: индекс ГК из 100 договоров строился минуту)."""
+    out: list[str] = []
+    for p in (c.number or "", c.path, c.text, *c.footnotes):
+        if p:
+            out += _part_terms(p)
+    return out
+
+
+@lru_cache(maxsize=200_000)
+def _part_terms(text: str) -> tuple[str, ...]:
+    return tuple(lemmas(text))
 
 
 def build_index(store: KitStore, contract_id: str) -> ContractIndex:
@@ -52,10 +67,15 @@ def build_index(store: KitStore, contract_id: str) -> ContractIndex:
 def get_index(store: KitStore, contract_id: str) -> ContractIndex:
     """Индекс договора из кэша; пересборка, если договор переимпортирован."""
     cid = _require_contract_id(contract_id)
-    per_store = _CACHE.setdefault(store, {})
-    idx = per_store.get(cid)
-    if idx is None or idx.revision != store.revision(cid):
-        idx = per_store[cid] = build_index(store, cid)
+    rev = store.revision(cid)
+    with _LOCK:
+        cache = _CACHE.get(store)
+        if cache is None:
+            cache = _CACHE[store] = BoundedCache(CLAUSE_CACHE_MAX, lambda x: len(x.clauses))
+    idx = cache.get(cid)
+    if idx is None or idx.revision != rev:
+        idx = build_index(store, cid)        # вне блокировки: договоры ГК строятся параллельно
+        cache.put(cid, idx)                  # предел памяти — store/cache.py
     return idx
 
 
@@ -64,9 +84,11 @@ def invalidate(contract_id: str | None = None) -> int:
     индекс после save(); явный сброс нужен подключению клиента (ADR 0011), чтобы память старого индекса
     освобождалась сразу и после удаления договора. Возвращает число сброшенных индексов."""
     n = 0
-    for per_store in list(_CACHE.values()):
-        for cid in [c for c in per_store if contract_id is None or c == contract_id]:
-            per_store.pop(cid, None)
+    with _LOCK:
+        caches = list(_CACHE.values())
+    for cache in caches:
+        for cid in [c for c in cache.snapshot() if contract_id is None or c == contract_id]:
+            cache.pop(cid)
             n += 1
     return n
 

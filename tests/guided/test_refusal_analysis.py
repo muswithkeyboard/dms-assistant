@@ -177,3 +177,51 @@ def test_kit_refusal_has_conclusion() -> None:
         assert a.summary.startswith("Вид помощи") and empty in a.summary, cid
         assert sum(c.verified for s in a.statements for c in s.citations) >= 3, cid
         assert a.label not in (Label.allowed, Label.denied), cid
+
+
+# ---------------------------------------------------------------- факты со слов менеджера (ответы на «Что уточнить»)
+
+def test_refusal_facts_from_question_and_later_answer_wins() -> None:
+    from dms_core.guided import refusal_facts
+
+    assert refusal_facts("клиника не дала отрезать ногу - оправдано?") == {"mode": None, "referral": None,
+                                                                           "reason": False}
+    f = refusal_facts("отказали в госпитализации, потому что нет направления? направление врача и согласование "
+                      "страховщика (гарантийное письмо) есть.")
+    assert f["referral"] is True and f["reason"] is True          # ответ менеджера позже слов клиники
+    assert refusal_facts("Экстренная или плановая госпитализация?")["mode"] is None   # это вопрос, а не факт
+    assert refusal_facts("отказали в экстренной госпитализации")["mode"] == "emergency"
+    assert refusal_facts("не положили в больницу. Плановая госпитализация.")["mode"] == "planned"
+    assert refusal_facts("госпитализация без направления")["referral"] is False
+
+
+def test_refusal_with_facts_changes_conclusion_and_asks() -> None:
+    st = _store()
+    q = "клиника не дала отрезать ногу - оправдано?"
+    # направление и согласование есть — основание «плановая без направления» снято, это не спрашивается
+    _s, run, _v, label = _answer(st, q + " направление врача и согласование страховщика (гарантийное письмо) есть.")
+    d = run.draft
+    assert text("refusal_sum_cleared", why="")[:20] in d.summary and "(п. 2.5" in d.summary
+    assert text("refusal_missing_referral") not in d.missing and text("refusal_missing_mode") not in d.missing
+    assert label not in (Label.allowed, Label.denied)
+    # плановая и направления нет — отказ обоснован (со ссылкой на порядок)
+    _s, run, _v, label = _answer(st, q + " Плановая госпитализация. направление врача нет.")
+    assert text("refusal_sum_justified", why="")[:14] in run.draft.summary and "(п. 2.5" in run.draft.summary
+    assert label not in (Label.allowed, Label.denied)
+    # направления нет, а плановая ли — неизвестно: только «может быть обоснован, если плановая»
+    _s, run, _v, _l = _answer(st, q + " направление врача нет.")
+    assert "Отказ может быть обоснован" in run.draft.summary and text("refusal_missing_mode") in run.draft.missing
+    # экстренная — порядок экстренной, плановый не основание
+    _s, run, _v, _l = _answer(st, q + " Экстренная.")
+    assert text("refusal_sum_cleared", why="")[:20] in run.draft.summary and "(п. 2.6" in run.draft.summary
+
+
+def test_lead_says_outcome_from_facts() -> None:
+    from dms_core.compose import _refusal_core
+
+    t = load_yaml("texts_ru/reply.yaml")
+    why = "госпитализация плановая, а направления нет"
+    assert _refusal_core(text("refusal_sum_justified", why=why), Label.conditional) == \
+        t["lead_refusal_justified"].format(why=why)
+    assert _refusal_core(text("refusal_sum_cleared", why="случай экстренный") + " Уточните: x.", Label.conditional) \
+        .startswith(t["lead_refusal_cleared"].split("{")[0])

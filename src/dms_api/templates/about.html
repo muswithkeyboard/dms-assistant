@@ -1,8 +1,31 @@
 {% extends "base.html" %}
 {% block title %}{{ t.pages.about_title }} · {{ t.app_name }}{% endblock %}
 {% block main %}
-<h1 class="page-title">{{ t.pages.about_title }}</h1>
-<section class="panel">
-  <p>{{ t.pages.about_text }}</p>
-</section>
+{# «О прототипе»: что умеет ассистент — карточки с иконками MAINS (static/icons/), арт — токен темы --art-band. #}
+<div class="about">
+  <section class="panel about__head">
+    <div class="about__art" aria-hidden="true"></div>
+    <div class="about__hero">
+      <span class="ico-tile ico-tile--lg"><span class="ico ico--md ico--doctor" aria-hidden="true"></span></span>
+      <div>
+        <h1 class="page-title">{{ t.pages.about_title }}</h1>
+        <p class="about__lead">{{ t.pages.about_lead }}</p>
+      </div>
+    </div>
+  </section>
+  <h2 class="about__h">{{ t.pages.about_features_title }}</h2>
+  <ul class="about__grid">
+    {% for f in t.pages.about_features %}
+    <li class="about__card">
+      <span class="ico-tile"><span class="ico ico--{{ f.icon }}" aria-hidden="true"></span></span>
+      <h3>{{ f.title }}</h3>
+      <p>{{ f.text }}</p>
+    </li>
+    {% endfor %}
+  </ul>
+  <section class="panel">
+    <p>{{ t.pages.about_text }}</p>
+    <p class="about__team">{{ t.pages.about_team }} <strong>{{ t.team }}</strong></p>
+  </section>
+</div>
 {% endblock %}

@@ -81,7 +81,7 @@
     s.onerror = function () { resolve(); };
     document.head.appendChild(s);
   });
-  ready.then(function () { var b = $("mock-banner"); if (b && MOCK && window.DMS_MOCK) { b.hidden = false; } });
+  ready.then(function () { var b = $("mock-banner"); if (b && MOCK && window.DMS_MOCK) { b.hidden = false; $("notice").hidden = false; } });
   // Ссылки внутри приложения сохраняют флаг демо-режима.
   function link(path) {
     if (!MOCK) { return path; }

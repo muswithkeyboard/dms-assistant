@@ -183,3 +183,15 @@ def test_knn_does_not_override_refusal():
         assert r.scenario == Scenario.sc02_info and r.source == "knn"      # без отказа kNN решает, как раньше
     finally:
         R.embedding_scenario = orig
+
+
+def test_clinic_name_with_conjunction_and_verb_service():
+    """Ревизия w18: «Мать и дитя» — одна клиника, не «Мать» + родственник; «Медси и Будь Здоров» — не одна;
+    «вырвать зуб» → услуга «удаление зуба»."""
+    st = agent_store()
+    s = rule_slots("Можно ли полечиться в клинике Мать и дитя?", ONE, st)
+    assert s.get("clinic") == "Мать и дитя" and "relative" not in s
+    assert rule_slots("В Медси и в Будь Здоров отказали в МРТ", ONE, st).get("clinic") == "Медси"
+    from dms_core.scenarios.route import procedure_service
+    assert procedure_service("можно ли вырвать зуб", "зуб", exclude=[]) == "удаление зуба"
+    assert procedure_service("Удалить папиллому на шее — по ДМС?", "папиллому шее", exclude=[]) == "папиллому шее"

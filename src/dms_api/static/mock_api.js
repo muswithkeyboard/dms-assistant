@@ -160,7 +160,7 @@
     (a.per_contract || []).forEach(function (pc) { (pc.statements || []).forEach(function (st) { add(st, pc.contract_id); }); });
     (a.statements || []).forEach(function (st) { add(st); });
     var pending = (a.clinic_choices || []).some(function (ch) { return !ch.selected; });
-    var ask = (a.questions || []).slice();
+    var ask = (a.questions || []).slice(), options = [];
     var lead;
     if (pending) {
       lead = "Нужно уточнить клинику: в перечне программы есть несколько похожих. Выберите, о какой спрашивает сотрудник, — и я проверю условия.";
@@ -184,9 +184,13 @@
       lead = "Пока не могу ответить: в вопросе нет услуги и клиники, а условия договора зависят от них.";
       if (!ask.length) { ask.push("О какой услуге и какой клинике идёт речь?"); }
       ask.push("Что именно написала клиника в отказе?");
+      // утверждение в «Что уточнить» — текстом, не кнопкой (ревизия w16)
+      ask.push("Не названа услуга или вид помощи — по ним проверяется программа.");
+      // варианты ответа на вопрос о программе (ChatReply.options) — когда программа чата не задана
+      if (!a.context.program) { ask.unshift("Какая программа у застрахованного?"); options = ["Стандарт", "Бизнес", "ВИП"]; }
     }
     var caution = (a.limitations || [])[0] || CAUTION;
-    return { lead: lead, points: points.slice(0, 6), ask: ask, caution: caution };
+    return { lead: lead, points: points.slice(0, 6), ask: ask, options: options, caution: caution };
   }
   function answerFor(text, chat, picks) {
     var a = answerCore(text, chat, picks);
@@ -1058,6 +1062,13 @@
       var st = qs.get("status") || "open";
       return ok(db.requests.filter(function (r) { return r.chat_id === m[1] && (st === "all" || r.status === st); }).map(publicReq));
     }
+    if ((m = /^\/api\/chats\/([^/]+)$/.exec(p)) && method === "DELETE") {
+      if (!findChat(m[1])) { return err(404, "Чат не найден."); }
+      db.chats = db.chats.filter(function (x) { return x.id !== m[1]; });
+      db.requests = db.requests.filter(function (r) { return r.chat_id !== m[1]; });
+      save();
+      return ok({ deleted: m[1] });
+    }
     if ((m = /^\/api\/chats\/([^/]+)$/.exec(p))) {
       var c = findChat(m[1]);
       return c ? ok(Object.assign(clone(c), { requests: db.requests.filter(function (r) { return r.chat_id === c.id; }).map(publicReq) })) : err(404, "Чат не найден.");
@@ -1073,6 +1084,34 @@
       }
       save();
       return ok(publicReq(r));
+    }
+    // Письмо HR / запрос в СК из ответа (на сервере — шаблоны drafts.yaml letters): вывод и основание из ответа.
+    if ((m = /^\/api\/requests\/([^/]+)\/letter$/.exec(p)) && method === "POST") {
+      var rl = findReq(m[1]), chl = rl && findChat(rl.chat_id);
+      if (!rl) { return err(404, "Запрос не найден."); }
+      // message — номер ответа среди ответов по документам (как на сервере), не номер сообщения
+      var ansl = rl.messages.filter(function (x) { return x.answer && x.answer.reply && !x.answer.reply.service; });
+      var al = ((body.message != null ? ansl[body.message] : ansl[ansl.length - 1]) || {}).answer;
+      if (!al || !al.reply) { return err(409, "В обращении ещё нет ответа для письма."); }
+      var ccl = contractOf(chl.context.contract_id), rep = al.reply, hr = body.to !== "insurer";
+      var topic = (rl.slots && rl.slots.service) || rl.title || "обращение";
+      var where = (ccl ? "договору № " + ccl.c.number + " (" + ccl.c.legal_entity + ")" : "договорам группы") + (chl.context.program ? ", программа «" + chl.context.program + "»" : "");
+      var citesl = [].concat.apply([], (al.statements || []).map(function (s) { return s.citations || []; }));
+      var basis = (rep.points || []).slice(0, 4).filter(function (pt) { return pt.quote; }).map(function (pt) {
+        var c = citesl.filter(function (x) { return pt.refs.indexOf(refOf(x)) >= 0; })[0] || {};
+        return "— " + (c.doc_title || "Документ договора") + (c.clause_number ? ", п. " + c.clause_number : "") + ": «" + pt.quote + "»";
+      }).join("\n");
+      var asks = (rep.ask || []).filter(function (q) { return /\?\s*$/.test(q); });
+      var bodyl = "Добрый день!\n\n" + (hr ? "По " + where + ", по обращению «" + topic + "»:\n" + rep.lead + "\n\nОснование по документам договора:\n"
+        : "Просим подтвердить условия по " + where + ", для обращения «" + topic + "».\n\nПо документам договора: " + rep.lead + "\n\nПункты, на которые мы опираемся:\n") + basis +
+        (asks.length ? "\n\nЧто нужно уточнить:\n" + asks.map(function (q) { return "— " + q; }).join("\n") : "") +
+        (hr ? "\n\nОтвет подготовлен по документам договора; окончательное решение по конкретному случаю принимает страховая компания.\n"
+          : "\n\nПросим сообщить, распространяется ли страховое покрытие на этот случай и на каких условиях.\n");
+      return ok({ template: hr ? "answer_hr" : "answer_insurer", to: hr ? "hr" : "insurer", subject: (hr ? "Ответ по обращению: " : "Запрос по договору: ") + topic, body: bodyl, unknown_fields: [] });
+    }
+    if (p === "/api/letters/check" && method === "POST") {
+      var txt = (body.subject || "") + "\n" + (body.body || "");
+      return ok({ promises: (txt.match(/гарантир\S*|точно оплат\S*|100\s?%/gi) || []), unfilled: (txt.match(/\[ЗАПОЛНИТЬ[^\]]*\]/g) || []).length });
     }
     if ((m = /^\/api\/requests\/([^/]+)\/automation\/(add-clinic|step)$/.exec(p))) {
       var rq = findReq(m[1]), chat = rq && findChat(rq.chat_id);

@@ -65,9 +65,11 @@ def test_reply_bubble_markup():
                  "detailBlocks(a, sources, { reply: true })", "clinicPickCard(a, isLast, msgIdx, true)"):
         assert part in body, part
     pt = _fn(code, "pointItem")
-    for part in ('"reply__text"', '"reply__quote"', '"reply__src"', '"reply__ref"', "openSource(sources, n - 1, b)",
+    # ссылка источника — sourceLink (w17-preview): клик открывает шторку, наведение/фокус — превью
+    for part in ('"reply__text"', '"reply__quote"', '"reply__src"', '"reply__ref"', "sourceLink(\"reply__ref\", c, sources, n - 1",
                  "docTitle(c)", "citeWhere(c)"):
         assert part in pt, part
+    assert "openSource(sources, idx, b)" in _fn(code, "sourceClick")
     # обратная совместимость: без reply — прежняя карточка
     assert "m.answer.reply ? replyBubble(" in code and ": answerCard(m.answer" in code
     # новый ответ объявляется коротко в aria-live, лента — role=log

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -22,9 +23,10 @@ from pathlib import Path
 from typing import Any, Self
 
 from ..config import derived_dir
-from ..constants import DocStatus
+from ..constants import CLAUSE_CACHE_MAX, DocStatus
 from ..schemas import CareMatrix, Clause, ClinicRow, Contract, Document, Group
 from . import dedup
+from .cache import BoundedCache
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (id TEXT PRIMARY KEY, name TEXT NOT NULL);
@@ -85,6 +87,11 @@ def _require_contract_id(contract_id: object) -> str:
     return contract_id
 
 
+class ContractNotLoaded(KeyError):
+    """Договора нет в базе комплекта (не импортирован или удалён). Отдельный класс (ревью 29.10.2026 п. 3): сервис
+    отвечает «договор не загружен» только на него, а не на любую KeyError внутри движка."""
+
+
 class KitStore:
     """Разобранный комплект. Одно соединение на объект, доступ под блокировкой (сервис многопоточный)."""
 
@@ -93,14 +100,49 @@ class KitStore:
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        self._conn.execute("PRAGMA foreign_keys = ON")
+        # пункты договора по метке ревизии (круг 2 ревизии w16): ответ по одному договору читал их 3–5 раз
+        # (guided, разделы, verify), в ГК 2 — по ~47 тыс. пунктов; save() меняет ревизию — кэш устаревает сам
+        self._clause_cache: BoundedCache[tuple[int | None, list[Clause]]] = BoundedCache(
+            CLAUSE_CACHE_MAX, lambda v: len(v[1]))
+        # один объект строки на одинаковый текст / путь: договоры ГК совпадают на 87–99 % (весь комплект — 61 тыс.
+        # пунктов и 3,6 тыс. разных текстов); пул — по ключу текста хранилища, растёт до числа разных текстов
+        self._pool: dict[str, str] = {}
+        self._conn = self._open()
+
+    def _open(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        conn.execute("PRAGMA foreign_keys = ON")
         if str(self.path) != ":memory:":
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
+        conn.executescript(_SCHEMA)
+        conn.commit()
+        return conn
 
     # ------------------------------------------------------------------ служебное
+
+    def replace_file(self, new_file: Path, target: Path | None = None) -> None:
+        """Заменить базу собранным файлом (импорт комплекта из интерфейса, ревью 29.10.2026 п. 1): под блокировкой
+        хранилища — сброс журнала WAL, закрытие соединения, атомарный os.replace, новое соединение. Объект тот же:
+        сервис, движок и default_store() видят новую базу сразу, недописанную — никогда (сборка шла в new_file).
+        target — путь базы, если хранилище было в памяти (чистая установка): дальше оно живёт в этом файле."""
+        dest = Path(target) if target is not None else self.path
+        if str(dest) == ":memory:":
+            raise ValueError("хранилище в памяти: укажите файл базы (target)")
+        with self._lock:
+            if str(self.path) != ":memory:":
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.close()
+            # журнал WAL старой базы не должен достаться новому файлу
+            for suffix in ("-wal", "-shm"):
+                dest.with_name(dest.name + suffix).unlink(missing_ok=True)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(new_file, dest)
+            self.path = dest
+            self._conn = self._open()
+            for key in self._clause_cache.snapshot():
+                self._clause_cache.pop(key)
+            self._pool.clear()
 
     def close(self) -> None:
         with self._lock:
@@ -150,6 +192,7 @@ class KitStore:
             if m.contract_id != cid:
                 raise ValueError(f"строка матрицы {m.program}/{m.care_type} не принадлежит договору {cid}")
 
+        self._pool.clear()                   # переимпорт: старые тексты договора пулом не удерживаются
         with self._tx() as conn:
             self._delete_contract(conn, cid)
             conn.execute("INSERT OR IGNORE INTO groups(id, name) VALUES (?, ?)",
@@ -186,6 +229,33 @@ class KitStore:
             self._insert_clauses(conn, clauses, group_id=group.id)
             dedup.drop_orphans(conn)
 
+    def add_documents(self, contract_id: str, documents: list[Document], clauses: list[Clause]) -> None:
+        """Дописать документы и их пункты к уже загруженному договору (документ из чата, ADR 0016) и сменить
+        ревизию договора: кэш пунктов (_clause_cache) и индекс поиска (index/search.get_index) пересоберутся по
+        метке ревизии сами. Изоляция — как в save(): документы и пункты только этого договора, пункты — только
+        добавляемых документов; id документа не должен совпадать с уже загруженным. Повторный save() договора
+        (импорт комплекта, обработка договора клиента) такие документы стирает."""
+        cid = self._known(contract_id)
+        own_docs = {d.id for d in documents}
+        for d in documents:
+            if d.contract_id != cid:
+                raise ValueError(f"документ {d.id} не принадлежит договору {cid}")
+        for cl in clauses:
+            if cl.contract_id != cid or cl.doc_id not in own_docs:
+                raise ValueError(f"пункт {cl.id} не принадлежит договору {cid}")
+        with self._tx() as conn:
+            if own_docs and conn.execute(
+                    f"SELECT 1 FROM documents WHERE id IN ({','.join('?' * len(own_docs))})",
+                    tuple(own_docs)).fetchone():
+                raise ValueError("документ с таким id уже загружен")
+            doc_start = conn.execute("SELECT COALESCE(MAX(ord), -1) + 1 FROM documents WHERE contract_id = ?",
+                                     (cid,)).fetchone()[0]
+            cl_start = conn.execute("SELECT COALESCE(MAX(ord), -1) + 1 FROM clauses WHERE contract_id = ?",
+                                    (cid,)).fetchone()[0]
+            self._insert_documents(conn, documents, start=doc_start)
+            self._insert_clauses(conn, clauses, group_id=None, start=cl_start)
+            conn.execute("UPDATE contracts SET revision = ? WHERE id = ?", (time.time_ns(), cid))
+
     def set_doc_status(self, doc_id: str, status: DocStatus, warning: str | None = None) -> None:
         """Статус готовности документа (ТЗ п. 7.1); предупреждение добавляется к Document.warnings."""
         with self._tx() as conn:
@@ -200,6 +270,8 @@ class KitStore:
 
     def delete_contract(self, contract_id: str) -> None:
         cid = _require_contract_id(contract_id)
+        self._clause_cache.pop(cid)
+        self._pool.clear()                   # тексты удалённого договора пулом не удерживаются
         with self._tx() as conn:
             self._delete_contract(conn, cid)
             dedup.drop_orphans(conn)
@@ -211,21 +283,22 @@ class KitStore:
             conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (cid,))
 
     @staticmethod
-    def _insert_documents(conn: sqlite3.Connection, documents: list[Document]) -> None:
+    def _insert_documents(conn: sqlite3.Connection, documents: list[Document], start: int = 0) -> None:
         conn.executemany(
             "INSERT INTO documents(id, contract_id, group_id, doc_type, ord, body) VALUES (?,?,?,?,?,?)",
             [(d.id, d.contract_id, d.group_id, d.doc_type.value, i, d.model_dump_json())
-             for i, d in enumerate(documents)])
+             for i, d in enumerate(documents, start=start)])
 
     @staticmethod
-    def _insert_clauses(conn: sqlite3.Connection, clauses: list[Clause], group_id: str | None) -> None:
+    def _insert_clauses(conn: sqlite3.Connection, clauses: list[Clause], group_id: str | None,
+                        start: int = 0) -> None:
         keys = dedup.put_texts(conn, [cl.text for cl in clauses])
         conn.executemany(
             "INSERT INTO clauses(id, doc_id, contract_id, group_id, ord, number, path, program, text_key, "
             "text_hash, footnotes, page) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [(cl.id, cl.doc_id, cl.contract_id, group_id, i, cl.number, cl.path, cl.program, key, cl.text_hash,
               json.dumps(cl.footnotes, ensure_ascii=False), cl.page)
-             for i, (cl, key) in enumerate(zip(clauses, keys, strict=True))])
+             for i, (cl, key) in enumerate(zip(clauses, keys, strict=True), start=start)])
 
     # ------------------------------------------------------------------ чтение: группы и договоры
 
@@ -245,14 +318,14 @@ class KitStore:
         бы как «клиник / пунктов нет» — это ложное «нет в документах» (`docs/rules.md` п. 3а)."""
         cid = _require_contract_id(contract_id)
         if not self._rows("SELECT 1 FROM contracts WHERE id = ?", (cid,)):
-            raise KeyError(f"договор {cid} не загружен")
+            raise ContractNotLoaded(f"договор {cid} не загружен")
         return cid
 
     def contract(self, contract_id: str) -> Contract:
         cid = _require_contract_id(contract_id)
         rows = self._rows("SELECT card FROM contracts WHERE id = ?", (cid,))
         if not rows:
-            raise KeyError(f"договор {cid} не загружен")
+            raise ContractNotLoaded(f"договор {cid} не загружен")
         return Contract.model_validate_json(rows[0][0])
 
     def contract_warnings(self, contract_id: str) -> list[str]:
@@ -290,18 +363,39 @@ class KitStore:
         return Clause(id=cid_, doc_id=doc_id, contract_id=contract_id, number=number, path=path, program=program,
                       text=text, footnotes=json.loads(footnotes), page=page, text_hash=th)
 
+    def _pooled(self, row: tuple) -> Clause:
+        """Пункт из строки базы с общими объектами строк текста и пути (_pool)."""
+        cid_, doc_id, contract_id, number, path, program, text, footnotes, page, th, key = row
+        pool = self._pool
+        if len(pool) > 4 * CLAUSE_CACHE_MAX:
+            pool.clear()                     # пул не держит тексты давно вытесненных договоров сверх предела кэша
+        text = pool.setdefault("t" + key, text)
+        # повторяющиеся строки (путь, документ, программа, номер, хэш текста) — тоже общие объекты
+        path, doc_id, th = pool.setdefault("p" + path, path), pool.setdefault("d" + doc_id, doc_id), \
+            pool.setdefault("h" + th, th)
+        program = pool.setdefault("g" + program, program) if program else program
+        number = pool.setdefault("n" + number, number) if number else number
+        return Clause(id=cid_, doc_id=doc_id, contract_id=contract_id, number=number, path=path, program=program,
+                      text=text, footnotes=json.loads(footnotes) if footnotes != "[]" else [], page=page,
+                      text_hash=th)
+
     def clauses(self, contract_id: str, doc_types: Iterable[str] | None = None) -> list[Clause]:
-        """Пункты документов договора в порядке документа. doc_types — фильтр по DocType (значения строк)."""
+        """Пункты документов договора в порядке документа. doc_types — фильтр по DocType (значения строк).
+        Пункты — общие объекты кэша: их не изменять (список — свой у каждого вызова)."""
         cid = self._known(contract_id)
-        sql = self._CLAUSE_SQL + "WHERE c.contract_id = ?"
-        params: list[Any] = [cid]
-        if doc_types is not None:
-            types = [str(getattr(t, "value", t)) for t in doc_types]
-            if not types:
-                return []
-            sql += (" AND c.doc_id IN (SELECT id FROM documents WHERE contract_id = ? AND doc_type IN ({}))".format(",".join("?" * len(types))))
-            params += [cid, *types]
-        return [self._clause(r) for r in self._rows(sql + " ORDER BY c.ord", params)]
+        rev = self.revision(cid)
+        got = self._clause_cache.get(cid)
+        if got is None or got[0] != rev:
+            with self._lock:
+                rows = self._rows(self._CLAUSE_SQL.replace(" FROM", ", t.key FROM", 1)
+                                  + "WHERE c.contract_id = ? ORDER BY c.ord", [cid])
+                got = (rev, [self._pooled(r) for r in rows])
+            self._clause_cache.put(cid, got)     # предел памяти — store/cache.py
+        if doc_types is None:
+            return list(got[1])
+        types = {str(getattr(t, "value", t)) for t in doc_types}
+        docs = {d.id for d in self.documents(cid) if d.doc_type.value in types}
+        return [c for c in got[1] if c.doc_id in docs]
 
     def clause(self, contract_id: str, number: str | None = None, path: str | None = None) -> list[Clause]:
         """Пункт по номеру («2.6.1») или пути. Номера в разных документах договора повторяются — список.

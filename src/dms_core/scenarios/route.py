@@ -72,6 +72,9 @@ _RELATIVES = {
 
 
 _QUESTION_END = re.compile(r"[^?]*\?")
+# тип учреждения в косвенном падеже перед названием: «клинике», «клинику», «медцентре», «медицинском центре»
+_TYPE_OBLIQUE = re.compile(r"^(?:клиник(?:е|у|ой|и)|медцентр(?:е|у|ом|а)|медицинск\w+\s+центр(?:е|у|ом|а))\s+",
+                           re.IGNORECASE)
 
 
 def _ordered(q: str) -> Scenario | None:
@@ -562,6 +565,13 @@ def procedure_service(question: str, service: str | None, *, exclude: list[str])
         alt = service_phrase(question, exclude=exclude)
         if alt and any(set(lemmas(n)) <= set(lemmas(alt)) for n in named):
             svc = alt
+        elif len(named) == 1 and (obj := alt or svc) and len(obj.split()) <= 2 and not refusal_marker(question) \
+                and _context_only(obj):
+            # «можно ли вырвать зуб»: в слоте одно общее дополнение вида помощи («зуб», config coverage_markers
+            # context) — услуга «процедура + дополнение в родительном падеже» («удаление зуба»), иначе ищутся все
+            # пункты о зубах (пломбы, чистка) — ревизия точности w18. Конкретное дополнение («папиллому») само
+            # называет услугу — слот прежний
+            svc = f"{next(iter(named))} {_genitive(obj)}"
     if not svc or not (named or procedure_class_word(svc)):
         return svc                       # в слоте нет процедуры («вызов врача на дом») — слот прежний
     kept = [w for w in svc.split() if not actor_word(w)]
@@ -574,6 +584,25 @@ def procedure_service(question: str, service: str | None, *, exclude: list[str])
         # «не положили в больницу»: в слоте только место — процедура шаблона отказа (procedures.refusal_service)
         return procedures_cfg().refusal_service
     return " ".join(kept) if content else svc
+
+
+def _context_only(phrase: str) -> bool:
+    """Все значимые слова фразы — общие слова вида помощи (config coverage_markers service.context: «зуб»)."""
+    from ..guided import _stem, coverage_cfg
+
+    context = {_stem(x) for x in coverage_cfg().context}
+    stems = [_stem(x) for x in lemmas(phrase)]           # lemmas() уже без служебных слов
+    return bool(stems) and all(st in context for st in stems)
+
+
+def _genitive(phrase: str) -> str:
+    """Слова в родительном падеже («зуб» → «зуба», «больной зуб» → «больного зуба»); что не склоняется — как есть."""
+    out = []
+    for w in phrase.split():
+        p = _analyzer().parse(w)[0]
+        g = p.inflect({"gent"}) if str(p.tag.POS) in ("NOUN", "ADJF") else None
+        out.append(g.word if g is not None else w)
+    return " ".join(out)
 
 
 def procedure_named_by_verb(question: str, objects: list[str]) -> bool:
@@ -905,6 +934,14 @@ def clinic_phrase(question: str, context: ChatContext, store: KitStore | None) -
     def cont(i: int) -> bool:
         w, _pos = toks[i]
         if w == "№" or re.fullmatch(r"№?\d{1,4}", w):
+            return True
+        if i and low(i - 1) == "и" and word(i) and not excluded(i) and w[:1].islower():
+            return True                            # слово после союза, принятого внутри названия («… и дитя»)
+        if low(i) == "и" and i + 1 < len(toks) and not excluded(i + 1) and toks[i + 1][0][:1].islower() and \
+                (i + 2 == len(toks) or not word(i + 2)) and parse(i + 1) is not None and \
+                str(parse(i + 1).tag.POS) == "NOUN" and not _route_word_token(low(i + 1)):
+            # «Мать и дитя»: за «и» одно строчное существительное в конце вопроса, не услуга — часть названия
+            # (w18: «клиники «Мать» нет в перечне» было ложным); «Медси и Будь Здоров» — две клиники, не одна
             return True
         if low(i) in ("им", "им.", "имени"):
             return True
@@ -1764,6 +1801,12 @@ def rule_slots(question: str, context: ChatContext, store: KitStore | None = Non
             slots["clinic"] = name
         elif after:
             slots["clinic"] = after
+    if slots.get("clinic") and "clinic_exact" not in slots:
+        # «в клинике Ромашка-Мед» → «Ромашка-Мед»: слово «клиника» в косвенном падеже — не часть названия (ревизия
+        # интерфейса w16: «Клиника «клинике Медси» не найдена»); «Клиника Доктор Боголюбов» (им. падеж) — остаётся
+        bare = _TYPE_OBLIQUE.sub("", slots["clinic"]).strip()
+        if bare and bare != slots["clinic"] and len(bare) >= 3:
+            slots["clinic"] = bare
     if "clinic" not in slots and (listed := listed_clinic(q, context, store)):
         # строчное название без кавычек — по отличительным словам перечня договора (w7-core)
         slots["clinic"] = listed
@@ -1830,8 +1873,10 @@ def rule_slots(question: str, context: ChatContext, store: KitStore | None = Non
             pass
     elif (m := _DATE_ISO.search(q)):
         slots["date"] = m.group(0)
+    # слова названия клиники («Мать и дитя») — не родственник
+    in_clinic = set(lemmas(slots.get("clinic") or ""))
     for lem in lemmas(q):
-        if lem in _RELATIVES:
+        if lem in _RELATIVES and lem not in in_clinic:
             slots["relative"] = _RELATIVES[lem]
             break
     if (refusal := refusal_marker(q)):

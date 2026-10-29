@@ -16,6 +16,7 @@ import queue
 import re
 import threading
 import time
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -76,8 +77,11 @@ def _mask_client_file_names() -> None:
 
 
 def create_app(settings: Settings | None = None, *, service: Service | None = None,
-               gate: security.HeavyGate | None = None) -> Starlette:
+               gate: security.HeavyGate | None = None, allowed_hosts: Iterable[str] | None = None) -> Starlette:
+    """allowed_hosts — имена для проверки Host сверх 127.0.0.1 / localhost / [::1]; None — DMS_ALLOWED_HOSTS."""
     settings = settings or Settings()
+    hosts = security.allowed_hosts_from_env() if allowed_hosts is None else security.parse_allowed_hosts(
+        allowed_hosts)
     svc = service or Service(data_dir=Path(settings.data_dir) if settings.data_dir else None)
     gate = gate or security.HeavyGate()
     json_limit = settings.max_json_kb * 1024
@@ -110,8 +114,12 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
     # ------------------------------------------------------------------ API: помощники
 
     async def json_body(request: Request) -> dict:
-        """Тело JSON не больше DMS_MAX_JSON_KB (413), корректный UTF-8 JSON-объект (422). Пустое тело — {}."""
+        """Тело JSON не больше DMS_MAX_JSON_KB (413), корректный UTF-8 JSON-объект (422). Пустое тело — {}.
+        Непустое тело — только с Content-Type application/json, иначе 415 (простой запрос text/plain со стороннего
+        сайта браузер шлёт без preflight; security.RequestGuardMiddleware)."""
         raw = await security.read_body(request, json_limit)
+        if raw.strip() and not security.is_json_content_type(request.headers.get("content-type")):
+            raise ServiceError(415, "unsupported_media_type", security.ERR_CONTENT_TYPE)
         data = security.parse_json_body(raw) if raw.strip() else {}
         if not isinstance(data, dict):
             raise ServiceError(422, "invalid_json", "Тело запроса должно быть объектом JSON.")
@@ -300,6 +308,56 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
         svc.delete_insurer_profile(request.path_params["pid"])
         return Response(status_code=204)
 
+    # ------------------------------------------------------------------ API: вложения чата и настройки (ADR 0016)
+
+    async def api_attachments(request: Request) -> Response:
+        """GET — вложения чата; POST multipart: file, request_id?, contract_id?, doc_type? — тело читается потоком
+        с пределом DMS_MAX_UPLOAD_MB (413); разбор — в потоке под слотом HeavyGate."""
+        chat_id = request.path_params["chat_id"]
+        if request.method == "GET":
+            return JSONResponse(svc.attachments(chat_id))
+        limit = settings.max_upload_bytes
+        raw = await security.read_body(request, limit + MULTIPART_OVERHEAD)
+
+        async def receive() -> dict:
+            return {"type": "http.request", "body": raw, "more_body": False}
+
+        try:
+            form = await Request(request.scope, receive).form(max_files=1, max_fields=10)
+        except Exception:  # noqa: BLE001 — битый multipart: понятная ошибка вместо 500
+            raise ServiceError(422, "bad_form", "Форма загрузки заполнена неверно: выберите файл.") from None
+        upload = form.get("file")
+        if upload is None or isinstance(upload, str):
+            raise ServiceError(422, "required", "Выберите файл.", "file")
+        data = await upload.read()
+        if len(data) > limit:
+            raise ServiceError(413, "payload_too_large", ui_texts()["errors"]["too_large"], "file")
+
+        def field(name: str) -> str | None:
+            v = form.get(name)
+            return (v.strip() or None) if isinstance(v, str) else None
+
+        async with gate.aslot(security.request_client(request)):
+            out = await anyio.to_thread.run_sync(lambda: svc.attach(
+                chat_id, filename=upload.filename or "", data=data, request_id=field("request_id"),
+                contract_id=field("contract_id"), doc_type=field("doc_type")))
+        return JSONResponse(out, status_code=201)
+
+    async def api_attachment(request: Request) -> Response:
+        """DELETE — удалить вложение чата (файл и пункты; у договора добавленный документ остаётся)."""
+        return JSONResponse(svc.delete_attachment(request.path_params["chat_id"], request.path_params["aid"]))
+
+    async def api_attachment_active(request: Request) -> Response:
+        return JSONResponse(svc.set_active_attachment(request.path_params["chat_id"], await json_body(request)))
+
+    async def api_settings(request: Request) -> Response:
+        if request.method == "PUT":
+            return JSONResponse(svc.save_settings(await json_body(request)))
+        return JSONResponse(svc.settings())
+
+    async def settings_page(_: Request) -> Response:
+        return page("settings.html", "settings")
+
     async def api_examples(_: Request) -> Response:
         return JSONResponse(svc.examples())
 
@@ -311,6 +369,8 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
         return JSONResponse(svc.chats())
 
     async def api_chat(request: Request) -> Response:
+        if request.method == "DELETE":
+            return JSONResponse(svc.delete_chat(request.path_params["chat_id"]))
         return JSONResponse(svc.chat(request.path_params["chat_id"]))
 
     async def api_chat_requests(request: Request) -> Response:
@@ -326,11 +386,21 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
         """Вопрос → Answer. Accept: text/event-stream — поток стадий (event: stage) и итог (event: answer);
         иначе обычный JSON {message, answer}. Ошибки до начала расчёта — обычным JSON с кодом HTTP."""
         body = await json_body(request)
-        req, chat, text = svc.prepare_message(request.path_params["rid"], body)
-        release = await acquire(security.request_client(request))
+        clarify = svc.clarify_of(body)        # ответ на вопрос из «Что уточнить» (необязательно)
+        req, chat, text = svc.prepare_message(request.path_params["rid"], body)   # помечает обращение занятым
+        try:
+            release_slot = await acquire(security.request_client(request))
+        except BaseException:
+            svc.release_busy(req.id)
+            raise
+
+        def release() -> None:
+            release_slot()
+            svc.release_busy(req.id)
+
         out: queue.SimpleQueue = queue.SimpleQueue()
         try:
-            in_thread(lambda on_stage: svc.answer_message(req, chat, text, on_stage), release, out)
+            in_thread(lambda on_stage: svc.answer_message(req, chat, text, on_stage, clarify), release, out)
         except BaseException:
             release()
             raise
@@ -378,6 +448,12 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
 
     async def api_step(request: Request) -> Response:
         return JSONResponse(svc.automation_step(request.path_params["rid"], await json_body(request)))
+
+    async def api_letter(request: Request) -> Response:
+        return JSONResponse(svc.letter(request.path_params["rid"], await json_body(request)))
+
+    async def api_letter_check(request: Request) -> Response:
+        return JSONResponse(svc.check_letter(await json_body(request)))
 
     async def api_draft(request: Request) -> Response:
         return JSONResponse(svc.edit_draft(request.path_params["did"], await json_body(request)))
@@ -427,6 +503,8 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
     @asynccontextmanager
     async def lifespan(_app):
         _ = svc.app            # открыть AppStore при старте: миграция схемы до первого запроса
+        if settings.warm:
+            threading.Thread(target=svc.warm, name="dms-warm", daemon=True).start()
         yield
 
     from starlette.middleware import Middleware
@@ -437,6 +515,8 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
             Route("/", index),
             Route("/documents", documents),
             Route("/about", about),
+            Route("/settings", settings_page),
+            Route("/api/settings", api_settings, methods=["GET", "PUT"]),
             Route("/healthz", healthz),
             Route("/version", version),
             Route("/api/groups", api_groups),
@@ -459,8 +539,11 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
             Route("/api/insurer-profiles/{pid}", api_profile, methods=["DELETE"]),
             Route("/api/clients/{gid}/contracts", api_client_contracts, methods=["POST"]),
             Route("/api/chats", api_chats, methods=["GET", "POST"]),
-            Route("/api/chats/{chat_id}", api_chat),
+            Route("/api/chats/{chat_id}", api_chat, methods=["GET", "DELETE"]),
             Route("/api/chats/{chat_id}/requests", api_chat_requests, methods=["GET", "POST"]),
+            Route("/api/chats/{chat_id}/attachments", api_attachments, methods=["GET", "POST"]),
+            Route("/api/chats/{chat_id}/attachments/active", api_attachment_active, methods=["PUT"]),
+            Route("/api/chats/{chat_id}/attachments/{aid}", api_attachment, methods=["DELETE"]),
             Route("/api/requests/{rid}", api_request),
             Route("/api/requests/{rid}/messages", api_message, methods=["POST"]),
             Route("/api/requests/{rid}/clinic", api_clinic, methods=["POST"]),
@@ -471,11 +554,14 @@ def create_app(settings: Settings | None = None, *, service: Service | None = No
             Route("/api/requests/{rid}/reopen", api_reopen, methods=["POST"]),
             Route("/api/requests/{rid}/rate", api_rate, methods=["POST"]),
             Route("/api/drafts/{did}", api_draft, methods=["PATCH"]),
+            Route("/api/requests/{rid}/letter", api_letter, methods=["POST"]),
+            Route("/api/letters/check", api_letter_check, methods=["POST"]),
             Mount("/static", StaticFiles(directory=HERE / "static"), name="static"),
         ],
         middleware=[
             Middleware(security.ProxyHeadersMiddleware, trusted=security.parse_networks(settings.proxies)),
             Middleware(security.SecurityMiddleware, hsts=settings.https),
+            Middleware(security.RequestGuardMiddleware, allowed_hosts=hosts),
             Middleware(security.GZipByPathMiddleware),
             Middleware(BaseHTTPMiddleware, dispatch=rate_limit),
         ],

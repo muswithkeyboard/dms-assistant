@@ -38,6 +38,7 @@
     <div class="messages" id="messages" role="log" aria-label="{{ t.nav.chat }}" tabindex="-1">
       <p class="muted" id="chat-empty">{{ t.chat.pick_chat }}</p>
     </div>
+    <div class="dropzone" id="dropzone" aria-hidden="true" hidden><p>{{ t.attach.drop }}</p></div>
     <p class="vh" id="announce" role="status" aria-live="polite"></p>
     <div id="request-tools"></div>
     <form class="ask" id="ask-form" novalidate>
@@ -48,12 +49,23 @@
       <div class="ask__bar">
         <button class="btn btn--small btn--link" type="button" id="examples-btn" aria-expanded="false" aria-controls="examples">{{ t.chat.examples_btn }} <span class="fold__n" id="examples-n"></span></button>
       </div>
+      {# Плашка активного вложения (ADR 0016): пока она есть, вопросы отвечаются по документу; ✕ — снова по договору. #}
+      <div class="attbar" id="attbar" hidden>
+        <span class="attbar__k">{{ t.attach.bar }}</span>
+        <span class="attbar__name" id="attbar-name"></span>
+        <button class="btn btn--small attbar__off" type="button" id="attbar-off" aria-label="{{ t.attach.bar_off }}" title="{{ t.attach.bar_off }}">✕</button>
+      </div>
       <label class="vh" for="question">{{ t.chat.question_label }}</label>
       <div class="ask__row">
+        <button class="btn ask__attach" type="button" id="attach-btn" aria-label="{{ t.attach.button }}" title="{{ t.attach.button_hint }}" disabled>
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false"><path d="M16.5 6.5v10a4.5 4.5 0 0 1-9 0V5a3 3 0 0 1 6 0v10.5a1.5 1.5 0 0 1-3 0V6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <input class="vh" type="file" id="attach-input" accept=".docx,.xlsx,.pdf,.txt" tabindex="-1" aria-hidden="true">
         <textarea id="question" rows="1" maxlength="4000" placeholder="{{ t.chat.question_placeholder }}" aria-describedby="ask-hint" disabled></textarea>
         <button class="btn btn--primary" type="submit" id="ask-btn" disabled>{{ t.chat.send }}</button>
       </div>
-      <p class="hint ask__hint" id="ask-hint">{{ t.chat.ask_hint }}</p>
+      <p class="vh" id="ask-hint">{{ t.chat.ask_hint }}</p>
+      <p class="hint ask__count" id="ask-count" aria-live="polite" hidden></p>
     </form>
   </section>
 
@@ -72,6 +84,7 @@
   <form id="new-chat-form" method="dialog" novalidate>
     <h2 id="nc-h">{{ t.new_chat.title }}</h2>
     <p class="hint">{{ t.new_chat.intro }}</p>
+    <p class="nc-pending" id="nc-pending" role="status" hidden></p>
     <fieldset class="seg">
       <legend>{{ t.new_chat.kind_legend }}</legend>
       <div class="seg__row">
@@ -111,5 +124,59 @@
       <button class="btn btn--primary" type="submit" id="nc-create">{{ t.new_chat.create }}</button>
     </div>
   </form>
+</dialog>
+
+{# Документ в чат с добавлением в документы договора (настройка «также в документы договора», ADR 0016):
+   договор (в чате ГК — выбор) и тип документа. При настройке «только в этом чате» диалог не показывается. #}
+<dialog class="dlg" id="att-dlg" aria-labelledby="att-h">
+  <form id="att-form" method="dialog" novalidate>
+    <h2 id="att-h">{{ t.attach.dlg_title }}</h2>
+    <p class="hint">{{ t.attach.dlg_intro }}</p>
+    <p class="kv"><span class="muted">{{ t.attach.dlg_file }}:</span> <strong id="att-file"></strong></p>
+    <div class="f">
+      <label for="att-contract">{{ t.attach.dlg_contract }}</label>
+      <select id="att-contract"></select>
+    </div>
+    <div class="f">
+      <label for="att-type">{{ t.attach.dlg_type }}</label>
+      <select id="att-type"></select>
+    </div>
+    <p class="alert" id="att-alert" role="alert" hidden></p>
+    <div class="dlg__actions">
+      <button class="btn" type="button" id="att-cancel">{{ t.common.cancel }}</button>
+      <button class="btn btn--primary" type="submit" id="att-send">{{ t.attach.dlg_send }}</button>
+    </div>
+  </form>
+</dialog>
+
+{# Вложения чата (меню «⋯» → «Вложения»): можно снова сделать документ активным. #}
+{# Письмо из ответа (Service.letter): тема и текст — правятся; перед копированием — проверка на обещания. #}
+<dialog class="dlg dlg--letter" id="letter-dlg" aria-labelledby="letter-h">
+  <h2 id="letter-h"></h2>
+  <p class="hint">{{ t.letters.hint }}</p>
+  <div class="f">
+    <label for="letter-subject">{{ t.letters.subject }}</label>
+    <input type="text" id="letter-subject" maxlength="300">
+  </div>
+  <div class="f">
+    <label for="letter-body">{{ t.letters.body }}</label>
+    <textarea id="letter-body" rows="14" maxlength="20000"></textarea>
+  </div>
+  <p class="hint" id="letter-status" role="status" aria-live="polite"></p>
+  <div class="dlg__actions">
+    <button class="btn" type="button" id="letter-close">{{ t.letters.close }}</button>
+    <button class="btn" type="button" id="letter-download">{{ t.letters.download }}</button>
+    <button class="btn" type="button" id="letter-mail">{{ t.letters.mail }}</button>
+    <button class="btn btn--primary" type="button" id="letter-copy">{{ t.letters.copy_btn }}</button>
+  </div>
+</dialog>
+
+<dialog class="dlg" id="att-list-dlg" aria-labelledby="attl-h">
+  <h2 id="attl-h">{{ t.attach.list_title }}</h2>
+  <p class="hint">{{ t.attach.list_intro }}</p>
+  <ul class="attlist" id="att-list"></ul>
+  <div class="dlg__actions">
+    <button class="btn" type="button" id="att-list-close">{{ t.common.close }}</button>
+  </div>
 </dialog>
 {% endblock %}

@@ -29,6 +29,7 @@ from pathlib import Path
 
 from ..constants import FRANCHISE_NOT_APPLICABLE, Insurer
 from ..io.docx_reader import DocxDoc, Para, Table, read_docx
+from ..io.zipguard import read_part
 from ..kit import KitContract
 from ..schemas import CareMatrix, Clause, ClinicRow, Contract, Franchise, Payment, Program
 from .base import ParsedContract, abs_path, files_of, make_document, text_hash
@@ -44,7 +45,7 @@ def _docx_plain_text(path: Path, limit: int) -> str:
     """Первые `limit` знаков текста document.xml без разметки — дешёвая проверка преамбулы без полного разбора."""
     try:
         with zipfile.ZipFile(path) as z:
-            xml = z.read("word/document.xml").decode("utf-8", "replace")
+            xml = read_part(z, "word/document.xml").decode("utf-8", "replace")
     except (OSError, KeyError, zipfile.BadZipFile):
         return ""
     xml = re.sub(r"</w:p>", "\n", xml[: limit * 20])

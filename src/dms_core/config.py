@@ -73,14 +73,17 @@ def load_yaml(name: str) -> Any:
         return yaml.safe_load(fh)
 
 
+@cache
 def prompt(name: str) -> str:
-    """Текст промпта config/prompts/<name>.md (версия — в первой строке)."""
+    """Текст промпта config/prompts/<name>.md (версия — в первой строке). Кэш — как у load_yaml: конфиг на ходу
+    не меняется (версия промпта читалась с диска дважды на каждый договор ответа)."""
     return (CONFIG_DIR / "prompts" / f"{name}.md").read_text(encoding="utf-8")
 
 
 def prompt_version(name: str) -> str:
     """Версия промпта из шапки «<!-- version: X -->»."""
-    first = prompt(name).splitlines()[0] if prompt(name) else ""
+    text = prompt(name)
+    first = text.splitlines()[0] if text else ""
     if "version:" in first:
         return first.split("version:", 1)[1].strip(" ->")
     return "unknown"

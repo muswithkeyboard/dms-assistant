@@ -81,7 +81,7 @@ def make_client(tmp: Path | None = None, *, settings: Settings | None = None, en
                   llm_factory=lambda: llm, answer_fn=engine, data_dir=tmp,
                   add_clinic=svc_kw.pop("add_clinic", None) or fake_add_clinic(), **svc_kw)
     app = create_app(settings or Settings(_env_file=None), service=svc, gate=gate)
-    return TestClient(app), svc, tmp
+    return TestClient(app, base_url="http://127.0.0.1"), svc, tmp
 
 
 def new_request(c: TestClient, context: dict | None = None) -> tuple[str, str]:

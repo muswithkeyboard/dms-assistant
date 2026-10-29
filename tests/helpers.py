@@ -11,6 +11,11 @@ for _p in (ROOT / "src", ROOT / "tests"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+# .env разработчика (модель-помощник Ollama и т. п.) тестами не читается: проверка не зависит от машины (w17)
+import dms_core.llm._common as _llm_common
+
+_llm_common.DOTENV_PATH = Path("/nonexistent/.env")
+
 
 class SkipTest(Exception):
     """Тест пропущен (нет данных или программы). scripts/run_tests.py считает это SKIP, а не FAIL."""
@@ -60,7 +65,7 @@ def client():
 
     from dms_api.app import create_app
 
-    return TestClient(create_app())
+    return TestClient(create_app(), base_url="http://127.0.0.1")
 
 
 from contextlib import contextmanager

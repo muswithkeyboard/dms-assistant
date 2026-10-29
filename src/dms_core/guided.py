@@ -86,7 +86,10 @@ _SENT = re.compile(r"[^.;!?\n]+[.;!?]?")
 _WORD = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 # Слова, которые есть почти в каждом пункте ДМС и услугу не отличают (по ним совпадение не считается).
 _GENERIC = frozenset({"помощь", "медицинский", "услуга", "обслуживание", "программа", "договор", "страхование",
-                      "застрахованный", "лечение", "проведение", "оказание", "прием", "врач", "консультация"})
+                      "застрахованный", "лечение", "проведение", "оказание", "прием", "врач", "консультация",
+                      # слова самого вопроса («Есть ли франшиза?»): основа «есть» требовалась во фрагменте пункта
+                      # и отсекала все пункты о франшизе (ревизия w18)
+                      "есть", "быть", "иметься"})
 
 
 @cache
@@ -236,14 +239,25 @@ class _Run:
     summary_parts: list[str] = field(default_factory=list)
     contradictions: list[DraftContradiction] = field(default_factory=list)
     clinic_choice: ClinicChoice | None = None     # кандидаты клиники для выбора менеджером (ADR 0010)
+    _all: list[Clause] | None = None
     _clauses: dict[str, Clause] | None = None
     _sections: Any = None
     _scope: dict[str, list[Clause]] = field(default_factory=dict)
 
+    def all_clauses(self, doc_types: list[str] | None = None) -> list[Clause]:
+        """Пункты договора в порядке документа — читаются из хранилища один раз на прогон (круг 2 ревизии w16:
+        в ГК из 100 договоров кэш хранилища вмещает не все договоры, и каждое чтение было новым разбором)."""
+        if self._all is None:
+            self._all = self.st.clauses(self.cid)
+        if doc_types is None:
+            return self._all
+        docs = {d.id for d in self.st.documents(self.cid) if d.doc_type.value in set(doc_types)}
+        return [c for c in self._all if c.doc_id in docs]
+
     def sections(self) -> _Sections:
         """Разделы пунктов договора (заголовки по пути, номеру и предшествующие) — строится один раз на прогон."""
         if self._sections is None:
-            self._sections = _Sections(self.st.clauses(self.cid))
+            self._sections = _Sections(self.all_clauses())
         return self._sections
 
     def scope(self, program: str) -> list[Clause]:
@@ -252,7 +266,7 @@ class _Run:
         if program not in self._scope:
             types = (load_yaml("verdict_rules.yaml") or {}).get("absent_sources", {}).get("exclusion") or \
                 ["program", "contract", "amendment"]
-            self._scope[program] = [c for c in self.st.clauses(self.cid, doc_types=types)
+            self._scope[program] = [c for c in self.all_clauses(list(types))
                                     if c.program is None or program_matches(c.program, program)]
         return self._scope[program]
 
@@ -272,13 +286,15 @@ class _Run:
 
     def clause(self, ref: str) -> Clause | None:
         if self._clauses is None:
-            self._clauses = {c.id: c for c in self.st.clauses(self.cid)}
+            self._clauses = {c.id: c for c in self.all_clauses()}
         return self._clauses.get(ref)
 
     def say(self, statement: str, cites: list[DraftCitation], *, kind: StatementKind = StatementKind.fact,
             supports: list[str] | None = None) -> None:
         if not cites:
             return
+        if _is_heading(statement) and all(_is_heading(c.quote or statement) for c in cites):
+            return                           # заголовок раздела («VII. … ФРАНШИЗЫ») — не условие и не факт (ревизия 9)
         key = (statement, tuple((c.ref, c.quote) for c in cites))
         for i, old in enumerate(self.statements):
             if (old.text, tuple((c.ref, c.quote) for c in old.citations)) == key:
@@ -298,9 +314,23 @@ class _Run:
         return (DraftCitation(ref=ref, quote=frag), frag) if frag else None
 
 
+def _is_heading(s: str) -> bool:
+    """Заголовок раздела, а не условие: «II. ФРАНШИЗА», «ПОРЯДОК ОБРАЩЕНИЯ» — в основном заглавные буквы или
+    короткая строка с римским номером. Из заголовка условие не выводится (ревизия 9: «с франшизой» из заголовка)."""
+    t = s.strip()
+    letters = [c for c in t if c.isalpha()]
+    if len(letters) >= 4 and sum(c.isupper() for c in letters) / len(letters) > 0.7:
+        return True
+    return bool(re.match(r"^[IVXLC]+\.\s", t)) and len(t) < 120
+
+
 def _clause_kind(s: str) -> StatementKind:
+    """Вид найденного фрагмента. Условие — только явная оговорка о порядке оказания: франшиза, направление врача или
+    страховщика, согласование со страховщиком, гарантийное письмо, «при условии». Слова «по согласованию» без
+    страховщика (рассылка полисов, график работы) условием помощи не считаются (ревизия 9)."""
     low = s.casefold()
-    if re.search(r"франшиз|по\s+направлени|согласован|при\s+условии", low):
+    if re.search(r"франшиз|по\s+направлени\w*\s+(?:лечащего\s+|врач|страховщик|застрахов)|"
+                 r"согласовани\w*\s+(?:со?\s+)?страховщик|гарантийн\w*\s+письм|при\s+условии", low):
         return StatementKind.condition
     if re.search(r"не\s+более|лимит|не\s+оплачива|исключ|не\s+входит|не\s+является|ограничен", low):
         return StatementKind.limitation
@@ -324,8 +354,44 @@ def _search_statements(run: _Run, query: str, program: str | None, stems: list[s
         dc, frag = got
         if need_hit and stems and _hits(stems, frag) < min(2, len(stems)):
             continue
+        if _is_heading(frag):                # заголовок раздела — не содержание пункта
+            continue
         run.say(frag, [dc], kind=_clause_kind(frag))
         n += 1
+        if _LEADS_ON.search(frag):
+            n += _continuation(run, h["ref"])
+    return n
+
+
+# Пункт обрывается перед содержанием («Страховая сумма … составляет:») — значение в следующих строках таблицы
+_LEADS_ON = re.compile(r"(?::|\bсоставля\w+|\bследующ\w+)\s*$", re.IGNORECASE)
+CONTINUATION_MAX = 3
+
+
+def _continuation(run: _Run, ref: str) -> int:
+    """Продолжение пункта-обрывка (круг 2 ревизии w16): следующие за ним строки без номера того же документа
+    (строки таблицы «к п. 2.2», абзацы перечня) — до первого пункта с номером, не больше CONTINUATION_MAX. Строки
+    берутся инструментом get_clause по пути — ссылки попадают в прогон и проходят citations.verify."""
+    cls = run.all_clauses()
+    ids = [c.id for c in cls]
+    if ref not in ids:
+        return 0
+    i = ids.index(ref)
+    n = 0
+    for cl in cls[i + 1:i + 1 + CONTINUATION_MAX]:
+        if cl.number is not None or cl.doc_id != cls[i].doc_id:
+            break
+        if cl.id not in collect_refs(run.call("get_clause", path=cl.path)):
+            break
+        got = run.cite_clause(cl.id, [])
+        if got is None or _is_heading(got[1]):
+            break
+        run.say(got[1], [got[0]], kind=_clause_kind(got[1]))
+        n += 1
+    nxt = cls[i + 1 + CONTINUATION_MAX] if n == CONTINUATION_MAX and i + 1 + CONTINUATION_MAX < len(cls) else None
+    if nxt is not None and nxt.number is None and nxt.doc_id == cls[i].doc_id:
+        # перечень длиннее показанного — неполный список не выдаётся за полный (ревизия круга 2)
+        run.missing.append(text("continuation_more", number=cls[i].number or cls[i].path))
     return n
 
 
@@ -369,7 +435,11 @@ def care_row_matches(row_care: str, stem_sets: list[list[str]]) -> bool:
     """Строка матрицы / перечня — нужный вид помощи: все основы одной из фраз есть в названии строки и
     упоминание не отрицательное («Поликлиническое обслуживание без стоматологии» — не стоматология).
     Строка с кодом вида помощи («dental») сравнивается по его названию из config/care_types.yaml."""
-    spec = ((load_yaml("care_types.yaml") or {}).get("care_types") or {}).get(row_care.strip().casefold())
+    cfg = load_yaml("care_types.yaml") or {}
+    # строка-страховой риск («Страхование критических заболеваний») — не вид помощи (care_types.yaml not_care_rows)
+    if any(re.search(rx, row_care, flags=re.IGNORECASE) for rx in cfg.get("not_care_rows") or []):
+        return False
+    spec = (cfg.get("care_types") or {}).get(row_care.strip().casefold())
     if spec:
         row_care = str(spec.get("name") or row_care)
     # составной заголовок ГК 2 «Поликлиника | Врач на дом» — несколько видов помощи: каждая часть отдельно
@@ -593,8 +663,19 @@ def _cite_matrix(run: _Run, row: dict[str, Any], stems: list[str]) -> list[Draft
             if got:
                 return [got[0]]
     plain = next((r for r in refs if run.clause(r) is None), None)
-    ref = plain or (refs[0] if refs else None)
-    return [DraftCitation(ref=ref, quote="" if plain else fragment(run.clause(ref).text, stems))] if ref else []
+    if plain:
+        return [DraftCitation(ref=plain, quote="")]
+    # пункта со словами услуги нет: пункт, где назван сам вид помощи строки, а не первый попавшийся (ревизия 9:
+    # «скорая помощь входит» с цитатой о помощи на дому)
+    care = key_stems(str(row.get("care_type") or ""))
+    for ref in refs[:50]:
+        cl = run.clause(ref)
+        if cl is not None and care and _hits(care, cl.text) >= min(2, len(care)):
+            got = run.cite_clause(ref, care)
+            if got:
+                return [got[0]]
+    ref = refs[0] if refs else None
+    return [DraftCitation(ref=ref, quote=fragment(run.clause(ref).text, stems))] if ref else []
 
 
 @dataclass
@@ -971,6 +1052,7 @@ def service_terms(service: str | None, *, skip: list[str] | None = None) -> list
     for ws in word_sets:
         req = [x for x in ws if not x.optional]
         opt = [x for x in ws if x.optional]
+        gen = procedure_cfg().generic
         if not req:
             if all(x.anatomy for x in opt):
                 continue                         # одна анатомия («колено») — услуга не названа
@@ -979,6 +1061,19 @@ def service_terms(service: str | None, *, skip: list[str] | None = None) -> list
             # без необязательных слов осталось одно второстепенное слово («плановый» от «планового терапевта»):
             # необязательные слова возвращаются в обязательные, иначе совпало бы любое «плановое …»
             req, opt = ws, []
+        elif opt and len(req) == 1 and req[0].lemma in (load_yaml("coverage_markers.yaml") or {}).get(
+                "ambiguous_alone", []) and any(x.optional and not x.anatomy and x.lemma not in gen for x in opt):
+            # слово процедуры, неоднозначное без области («протезирование» — и сосудов, и зубов; config
+            # coverage_markers.yaml ambiguous_alone): слово области обязательно — иначе «протезы сосудов» давали
+            # ложное «входит» на вопрос о протезировании зубов (ревизия главного пункта w18)
+            req, opt = req + [x for x in opt if x.optional and not x.anatomy and x.lemma not in gen], \
+                [x for x in opt if not (x.optional and not x.anatomy and x.lemma not in gen)]
+        elif opt and all(x.lemma in procedure_cfg().generic and not x.qualifier for x in req):
+            # осталось одно общее слово процедуры («удаление» от «удаления зуба», procedures.generic): само по себе оно
+            # услугу не называет — без «зуба» совпали бы «удаление ВМС», «удаление кист» (ревизия точности w18);
+            # обязательным становится необщее слово («зуб»), общее («в стационаре») остаётся необязательным
+            req, opt = req + [x for x in opt if x.lemma not in gen], [x for x in opt if x.lemma in gen]
+
         if all(x.qualifier for x in req):
             continue                             # остались одни уточнения — главное слово услуги потеряно
         t = ServiceTerms(tuple(x.stem for x in req), tuple(x.stem for x in opt),
@@ -1107,6 +1202,24 @@ def exclusion_hit(variants: list[ServiceTerms], seg: str) -> bool:
         return True
     return any(_any_hit(variants, part, lead=cfg.item_lead_words, by_lemma=True)
                for part in _ITEM_SPLIT.split(seg) if part.strip())
+
+
+def scoped_only_hit(variants: list[ServiceTerms], seg: str, question: str = "") -> bool:
+    """Услуга названа в пункте исключений только как часть другого («Зубопротезирование и подготовка к нему,
+    включая … удаление и депульпирование зубов»): до слов «включая / в том числе»
+    (config coverage_markers.yaml exclusion_scope) услуги нет, после — есть. Исключена услуга лишь в рамках
+    главного («удаление зуба как подготовка к протезированию»), а не вообще — оговорка (условие other), не «нельзя»
+    (ревизия точности w18: «удаление зуба» → ложное «нельзя»)."""
+    rx = (load_yaml("coverage_markers.yaml") or {}).get("exclusion_scope")
+    m = re.search(rx, _norm(seg)) if rx else None
+    if m is None:
+        return False
+    head, tail = _norm(seg)[:m.start()], _norm(seg)[m.end():]
+    if not (not _any_hit(variants, head, actions=False) and _any_hit(variants, tail, actions=False)):
+        return False
+    # вопрос сам о том, к чему подготовка («удаление зуба перед протезированием») — исключение действует
+    purpose = [st for st in key_stems(head) if len(st) >= 5]
+    return not (question and any(phrase_hit([st], question, negation_aware=False) for st in purpose))
 
 
 def compound_only_hit(variants: list[ServiceTerms], seg: str) -> bool:
@@ -1578,7 +1691,8 @@ def coverage_hits(run: _Run, program: str, services: list[ServiceTerms],
                     not _any_hit(services, seg, lead=cfg.lead_words):
                 continue
             hit = _Hit(clause=cl, segment=seg, section=sec, heads=heads, caution=sec == "exclusion" and
-                       (_cautious(caution_scope(seg, services)) or compound_only_hit(services, seg)),
+                       (_cautious(caution_scope(seg, services)) or compound_only_hit(services, seg)
+                        or scoped_only_hit(services, seg, question)),
                        negated=sec == "included" and (_negated(seg) or in_exception_only(services, seg)))
             if care_head:
                 hit.section = "condition"         # заголовок вида помощи даёт только условие, не «входит»
@@ -2055,7 +2169,7 @@ def listing_citation(run: _Run, program: str, lrows: list[dict[str, Any]], state
     Только если и таблицу назвать нельзя (id строки другого вида) — первая строка перечня программы, как раньше."""
     from .citations import list_table_ref, normalize, related
 
-    for cl in run.st.clauses(run.cid):
+    for cl in run.all_clauses():
         if len(cl.text) > LISTING_TITLE_MAX or not _LISTING_TITLE.search(cl.text):
             continue
         if not related(statement, [cl.text, cl.path]):
@@ -2070,7 +2184,7 @@ def listing_citation(run: _Run, program: str, lrows: list[dict[str, Any]], state
     if table and m:
         first = int(m.group(1))
         heads = []
-        for cl in run.st.clauses(run.cid):
+        for cl in run.all_clauses():
             k = re.fullmatch(re.escape(table) + r"r(\d+)(?:[@#p].*)?", cl.id)
             if k is None or int(k.group(1)) >= first or len(cl.text) > LISTING_TITLE_MAX:
                 continue
@@ -2329,6 +2443,13 @@ def _franchise_clauses(run: _Run, program: str) -> list[str]:
 
 # ---------------------------------------------------------------- сценарии
 
+def _ask_program(run: _Run, slots: dict[str, Any]) -> None:
+    """Вопрос о программе: заданной в чате программы у договора нет — так и сказано (с её названием)."""
+    nf = slots.get("program_not_found")
+    run.questions.append(text("question_program_not_found", program=nf) if nf else text("question_program"))
+    run.missing.append(text("missing_program_not_found", program=nf) if nf else text("missing_program"))
+
+
 def resolve_program(cid: str, st: KitStore, context: ChatContext, slots: dict[str, Any]) -> str | None:
     """Программа: контекст → слот (только если она есть у ЭТОГО договора) → единственная программа договора."""
     names = [p.name for p in st.contract(cid).programs]
@@ -2568,8 +2689,7 @@ def _sc01(run: _Run, question: str, program: str | None, slots: dict[str, Any], 
             refusal_analysis(run, question, None, slots, str(service))
         return
     if not program:
-        run.questions.append(text("question_program"))
-        run.missing.append(text("missing_program"))
+        _ask_program(run, slots)
         return
     conds: list[str] = []
     cov, cc = Coverage(), CareCheck()
@@ -2937,7 +3057,7 @@ def _contract_scope(run: _Run) -> list[Clause]:
     """Пункты договора без программ (разбор неизвестной СК, ADR 0011): договор, доп. соглашения, программа."""
     types = (load_yaml("verdict_rules.yaml") or {}).get("absent_sources", {}).get("exclusion") or \
         ["program", "contract", "amendment"]
-    return list(run.st.clauses(run.cid, doc_types=types))
+    return list(run.all_clauses(list(types)))
 
 
 def procedure_cfg_verbs() -> list[str]:
@@ -2979,6 +3099,34 @@ def _where(program: str | None) -> dict[str, str]:
         return {"program": program, "of_prog": text("refusal_of_program", program=program),
                 "by_prog": text("refusal_by_program", program=program)}
     return {"program": "", "of_prog": text("refusal_of_contract"), "by_prog": text("refusal_by_contract")}
+
+
+def _last_hit(patterns: list[str], text_: str) -> int:
+    """Позиция конца последнего совпадения любого шаблона в тексте; нет совпадений — -1."""
+    pos = -1
+    for p in patterns:
+        for m in re.finditer(p, text_):
+            pos = max(pos, m.end())
+    return pos
+
+
+def refusal_facts(question: str) -> dict[str, Any]:
+    """Факты обращения о госпитализации со слов менеджера (config/texts_ru/reply.yaml refusal_facts): mode —
+    «emergency» / «planned» / None, referral — есть ли направление и согласование (True / False / None), reason —
+    названа ли причина отказа (reply.yaml reason_rx, как у compose). Названы оба варианта — берётся более поздний в
+    тексте: ответ на уточнение дописан в конец вопроса (клиника сказала «нет направления» → менеджер: «есть»).
+    Это слова менеджера, а не условия договора: в выводе они так и названы («со слов менеджера»)."""
+    cfg = load_yaml("texts_ru/reply.yaml") or {}
+    rf = cfg.get("refusal_facts") or {}
+    n = _norm(question)
+    em, pl = _last_hit(rf.get("emergency") or [], n), _last_hit(rf.get("planned") or [], n)
+    # «экстренно или планово» в одном месте — это вопрос, а не факт
+    both = em >= 0 and pl >= 0 and abs(em - pl) < 40
+    mode = None if both or (em < 0 and pl < 0) else ("emergency" if em > pl else "planned")
+    yes, no = _last_hit(rf.get("referral_yes") or [], n), _last_hit(rf.get("referral_no") or [], n)
+    referral = None if yes < 0 and no < 0 else yes > no
+    reason = bool(cfg.get("reason_rx") and re.search(cfg["reason_rx"], question or "", flags=re.IGNORECASE))
+    return {"mode": mode, "referral": referral, "reason": reason}
 
 
 def refusal_analysis(run: _Run, question: str, program: str | None, slots: dict[str, Any], service: str
@@ -3042,31 +3190,63 @@ def refusal_analysis(run: _Run, question: str, program: str | None, slots: dict[
                           program=program, service=service, klass=pc.name))
     else:
         parts.append(text("refusal_sum_no_care", program=program, service=service, klass=pc.name))
+    # факты со слов менеджера (ответы на «Что уточнить», followup.clarify_fact): экстренно / планово, есть ли
+    # направление и согласование, названа ли причина — меняют основания и итог, уже известное не спрашивается
+    facts = refusal_facts(question)
+    mode, referral = facts["mode"], facts["referral"]
+    planned_num = _num(run, orders["planned"]) if "planned" in orders else ""
+    emergency_num = _num(run, orders["emergency"]) if "emergency" in orders else ""
     grounds: list[str] = []
+    justified: str | None = None      # основание отказа подтверждено фактами
+    cleared: list[str] = []           # основание порядка госпитализации снято фактами
     if "planned" in orders:
-        grounds.append(text("refusal_ground_planned", num=_num(run, orders["planned"])))
+        if mode == "emergency" and "emergency" in orders:
+            parts.append(text("refusal_fact_emergency", num=emergency_num))
+            cleared.append(text("refusal_why_emergency", num=emergency_num))
+        elif referral is True:
+            parts.append(text("refusal_fact_referral_ok", num=planned_num))
+            cleared.append(text("refusal_why_referral_ok", num=planned_num))
+        elif referral is False and mode == "planned":
+            parts.append(text("refusal_fact_referral_no", num=planned_num))
+            justified = text("refusal_why_planned_no_referral", num=planned_num)
+        elif referral is False:
+            # плановая ли — неизвестно: отказ обоснован только для плановой (основание с фактом, без итога)
+            grounds.append(text("refusal_ground_planned_no_referral", num=planned_num))
+        else:
+            grounds.append(text("refusal_ground_planned", num=planned_num))
     if excl:
         grounds.append(text("refusal_ground_exclusion"))
     if main is not None and not main[1]:
         grounds.append(text("refusal_ground_care_absent", care=main[0]))
-    parts.append(text("refusal_sum_grounds", grounds="; ".join(grounds)) if grounds else
-                 text("refusal_sum_no_grounds"))
-    if "emergency" in orders:
-        parts.append(text("refusal_sum_emergency", num=_num(run, orders["emergency"]), **where))
-    asks = [text("refusal_ask_mode")] if orders else []
-    if "planned" in orders:
+    if justified:
+        parts.append(text("refusal_sum_justified", why=justified))
+    elif grounds:
+        parts.append(text("refusal_sum_grounds", grounds="; ".join(grounds)))
+    elif cleared:
+        parts.append(text("refusal_sum_cleared", why="; ".join(cleared)))
+    else:
+        parts.append(text("refusal_sum_no_grounds"))
+    if "emergency" in orders and mode is None and not justified:
+        parts.append(text("refusal_sum_emergency", num=emergency_num, **where))
+    # экстренно или планово — не спрашиваем, если направление и согласование есть: условие выполнено в обоих случаях
+    mode_needed = bool(orders) and mode is None and referral is not True
+    asks = [text("refusal_ask_mode")] if mode_needed else []
+    if "planned" in orders and referral is None and mode != "emergency":
         asks.append(text("refusal_ask_referral"))
     if not slots.get("clinic"):
         asks.append(text("refusal_ask_clinic"))
-    asks.append(text("refusal_ask_reason"))
-    parts.append(text("refusal_sum_ask", asks=", ".join(asks)))
+    if not facts["reason"]:
+        asks.append(text("refusal_ask_reason"))
+    if asks:
+        parts.append(text("refusal_sum_ask", asks=", ".join(asks)))
     run.summary_parts.append(" ".join(parts))
-    # (д) уточнения — не блокирующие: ответ уже дан
-    if orders:
+    # (д) уточнения — не блокирующие: ответ уже дан; известное со слов менеджера не спрашивается
+    if mode_needed:
         run.missing.append(text("refusal_missing_mode"))
-    if "planned" in orders:
+    if "planned" in orders and referral is None and mode != "emergency":
         run.missing.append(text("refusal_missing_referral"))
-    run.missing.append(text("refusal_missing_reason"))
+    if not facts["reason"]:
+        run.missing.append(text("refusal_missing_reason"))
     # вид помощи для проверки клиники: вид из разбора (матрица), а не слово услуги (дефект 3 ревизии 8)
     types = (load_yaml("care_types.yaml") or {}).get("care_types") or {}
     code = main[2] if main is not None else (codes[0] if codes else "")
@@ -3154,11 +3334,135 @@ def _payments(run: _Run, on: dt.date) -> None:
     run.summary_parts.append(st)
 
 
+@cache
+def _card_cfg() -> tuple[tuple[tuple[str, tuple[re.Pattern[str], ...]], ...], re.Pattern[str] | None, dict[str, str]]:
+    """Темы справочных вопросов о договоре, исключения и слова страховщиков (config/route_markers.yaml)."""
+    cfg = load_yaml("route_markers.yaml") or {}
+    topics = tuple((t, tuple(re.compile(p, re.IGNORECASE) for p in pats))
+                   for t, pats in (cfg.get("card_topics") or {}).items())
+    excl = re.compile(cfg["card_exclude"], re.IGNORECASE) if cfg.get("card_exclude") else None
+    return topics, excl, dict(cfg.get("card_insurer_words") or {})
+
+
+def card_topics(question: str, *, within: str | None = None) -> list[str]:
+    """Темы справочного вопроса о договоре (route_markers.yaml card_topics): срок, численность, страховщик; вопрос
+    о другом сроке / числе (card_exclude: «срок гарантийного письма», «сколько можно прикрепить») — не справка.
+    within — проверка слота: темы, в совпадение которых в тексте within входят все слова question."""
+    topics, excl, _w = _card_cfg()
+    text_ = within if within is not None else question
+    if not text_ or (excl is not None and excl.search(text_)):
+        return []
+    out: list[str] = []
+    # слова самого договора («договор», «полис») в слоте не мешают: «числа действует договор» — тоже тема срока
+    words = [w[:4] for w in re.findall(r"\w+", (question or "").casefold()) if w[:4] not in ("дого", "поли")]
+    for topic, pats in topics:
+        for rx in pats:
+            m = rx.search(text_)
+            if m and (within is None or (words and all(w in m.group(0).casefold() for w in words))):
+                out.append(topic)
+                break
+    return out
+
+
+_MONTHS_GEN = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",
+               "ноября", "декабря")
+
+
+def _date_rx(iso: str) -> str:
+    """Дата во всех записях договоров комплекта: «01.05.2026», «1 мая 2026», ««01» мая 2026»."""
+    d = dt.date.fromisoformat(iso)
+    return (rf"(?:(?<![\d.])0?{d.day}\.{d.month:02d}\.{d.year}|(?<!\d)«?(?<!\d)0?{d.day}»?\s+{_MONTHS_GEN[d.month - 1]}"
+            rf"\s+{d.year})")
+
+
+def _card_rx(topic: str, card: dict[str, Any]) -> tuple[str, re.Pattern[str], re.Pattern[str]] | None:
+    """(запрос поиска, признак пункта договора с этим фактом карточки, где в пункте само значение) — пункт должен
+    содержать значение карточки и слова темы; цитата — окно вокруг значения; значения в карточке нет — None."""
+    v = card.get(topic if topic != "period" else "period_to")
+    if v in (None, "", "unknown"):
+        return None
+    if topic == "period":
+        if not card.get("period_from"):
+            return None
+        rx = rf"(?=.*{_date_rx(card['period_from'])})(?=.*{_date_rx(card['period_to'])})(?=.*(?:срок|действ|вступа))"
+        return ("срок действия договора вступает в силу действует до", re.compile(rx, re.IGNORECASE | re.DOTALL),
+                re.compile(_date_rx(card["period_to"]), re.IGNORECASE))
+    if topic == "headcount":
+        num = rf"(?<![\d,.]){int(v)}(?![\d,.])"
+        rx = rf"(?=.*(?:численност|количеств\w*\s+застрахованн))(?=.*{num})"
+        return ("общая численность застрахованных составляет", re.compile(rx, re.IGNORECASE | re.DOTALL),
+                re.compile(num))
+    if topic == "insurer" and v in _card_cfg()[2]:
+        name = _card_cfg()[2][v]
+        rx = re.compile(rf"страховщик.{{0,40}}?{name}|{name}.{{0,200}}?страховщик", re.IGNORECASE | re.DOTALL)
+        return f"{name} именуемое в дальнейшем страховщик", rx, re.compile(name, re.IGNORECASE)
+    return None
+
+
+def _card(run: _Run, topics: list[str]) -> int:
+    """Справочные факты карточки договора по темам вопроса (card_topics): срок, численность, страховщик. Значение
+    берётся из карточки, а ссылка — пункт договора / доп. соглашения, где стоит это же значение и слова темы
+    (search_clauses, дословный фрагмент); такого пункта нет — факт не утверждается, в «Что уточнить» — куда
+    смотреть (`docs/rules.md` п. 1: утверждение без ссылки на экран не попадает). Возвращает число утверждений."""
+    res = run.call("contract_card")
+    card = (res or {}).get("contract") or {}
+    n = 0
+    for topic in topics:
+        spec = _card_rx(topic, card)
+        cite = None
+        if spec is not None:
+            query, rx, value = spec
+            hits = run.call("search_clauses", query=query, k=20, doc_types=["contract", "amendment"]).get("hits")
+            for h in hits or []:
+                cl = run.clause(h["ref"])
+                if cl is not None and rx.search(cl.text):
+                    m = value.search(cl.text)
+                    cite = DraftCitation(ref=cl.id, quote=_shorten_quote(cl.text, m.end() if m else 0))
+                    break
+        if cite is None:
+            run.missing.append(text("missing_card_field", field=text(f"card_field_{topic}")))
+            continue
+        if topic == "period":
+            st = text("card_period", date_from=_date_ru(card["period_from"]), date_to=_date_ru(card["period_to"]))
+        elif topic == "insurer":
+            st = text("card_insurer", value=((load_yaml("texts_ru/ui.yaml") or {}).get("insurers") or {})
+                      .get(card["insurer"], card["insurer"]))
+        else:
+            st = text(f"card_{topic}", value=card[topic])
+        run.say(st, [cite])
+        run.summary_parts.append(st)
+        n += 1
+    return n
+
+
+QUOTE_TAIL = 30
+
+
+def _shorten_quote(text: str, end: int = 0, limit: int = 300) -> str:
+    """Дословный фрагмент пункта не длиннее limit (по границам слов), в котором есть значение, кончающееся на end
+    (ревизия круга 2: «…составляет 67 человек» стояло за первыми 300 знаками пункта)."""
+    if len(text.strip()) <= limit:
+        return text.strip()
+    stop = max(min(end + QUOTE_TAIL, len(text)), min(limit, len(text)))   # значение и несколько слов после него
+    stop = text.find(" ", stop) if text.find(" ", stop) > 0 else len(text)
+    start = max(0, stop - limit)
+    if start:
+        start = text.find(" ", start) + 1
+    return text[start:stop].strip(" ,;:")
+
+
 def _sc02(run: _Run, question: str, scenario: Scenario, program: str | None, slots: dict[str, Any],
           context: ChatContext) -> None:
     # программы договора: карточка + программы матрицы видов помощи (разбор мог найти их только в приложении)
     names = _program_names(run)
     stems = key_stems(question)
+    # справочный вопрос о самом договоре — без вида помощи, клиники и услуги («срок действия полиса на МРТ» — нет);
+    # слот услуги из слов самой темы («срок действия», «числа» из «до какого числа») справку не отменяет
+    topics = [] if any(slots.get(k) for k in ("care_type", "clinic")) or \
+        (slots.get("service") and not card_topics(str(slots["service"]), within=question)) else card_topics(question)
+    if topics and not _PAY.search(question):
+        _card(run, topics)
+        return                               # справка из карточки — без поиска по тексту (он находил чужие сроки)
     if _PAY.search(question):
         on = context.date or (dt.date.fromisoformat(slots["date"]) if slots.get("date") else dt.date.today())
         _payments(run, on)
@@ -3185,7 +3489,8 @@ def _sc02(run: _Run, question: str, scenario: Scenario, program: str | None, slo
                     [DraftCitation(ref=rows[0]["ref"], quote=str(rows[0].get("clinic_name") or ""))])
             add_alternatives(run, program, str(care), near=slots.get("city"), exclude=None)
     elif not program and len(names) > 1 and (care or clinic):
-        run.questions.append(text("question_program"))
+        run.questions.append(text("question_program_not_found", program=slots["program_not_found"])
+                             if slots.get("program_not_found") else text("question_program"))
     if program and care:
         res = run.call("care_matrix", program=program)
         sets = _care_stem_sets(care, slots.get("service"))
@@ -3388,6 +3693,11 @@ def run_guided(contract_id: str, question: str, *, scenario: Scenario | str, slo
         steps += 1
     run = _Run(cid=cid, st=st, execute=execute)
     program = resolve_program(cid, st, context, slots)
+    # программа задана (в чате или в вопросе), но у этого договора такой нет — вопрос «какая программа?» говорит об
+    # этом прямо, а не «не известна» (менеджер её выбирал; аудит уточнений 29.10.2026)
+    given = context.program or slots.get("program")
+    if program is None and given:
+        slots = {**slots, "program_not_found": str(given)}
     checks: Checks | None = None
     if sc == Scenario.sc01:
         checks = Checks()

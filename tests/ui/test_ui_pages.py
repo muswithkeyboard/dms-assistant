@@ -14,7 +14,7 @@ from helpers import ROOT, client
 
 TPL = ROOT / "src" / "dms_api" / "templates"
 STATIC = ROOT / "src" / "dms_api" / "static"
-PAGE_JS = ["common.js", "chat.js", "documents.js", "clients.js", "theme.js"]   # скрипты страниц (mock_api.js — демо-данные)
+PAGE_JS = ["common.js", "chat.js", "documents.js", "clients.js", "theme.js", "settings.js"]   # скрипты страниц (mock_api.js — демо-данные)
 CYR = re.compile(r"[А-Яа-яЁё]")
 
 
@@ -70,7 +70,7 @@ def test_page_js_texts_only_from_ui_yaml():
 def test_js_text_keys_exist():
     """Каждый T("путь") существует в ui.yaml; префиксы T("путь." + x) — разделы ui.yaml."""
     ui = _ui()
-    for name in ("common.js", "chat.js", "documents.js", "clients.js"):
+    for name in ("common.js", "chat.js", "documents.js", "clients.js", "settings.js"):
         code = (STATIC / name).read_text(encoding="utf-8")
         for key in re.findall(r"\bT\(\"([a-z_.]+)\"\s*[,)]", code):
             assert isinstance(_lookup(ui, key), str), f"{name}: нет текста {key}"

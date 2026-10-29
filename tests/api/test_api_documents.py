@@ -64,12 +64,17 @@ def _docx_bytes(document_xml: str = "<w:document/>") -> bytes:
 
 
 def test_upload_signature_metadata_and_statuses():
-    c, _svc, tmp = make_client(engine=FakeEngine())
+    c, svc, tmp = make_client(engine=FakeEngine())
     ok = c.post("/api/documents", files={"file": ("Памятка.txt", "Памятка застрахованному: телефон пульта.".encode())},
                 data={"contract_id": "c01", "uploaded_by": "Оператор"})
     assert ok.status_code == 201, ok.text
     d = ok.json()
-    assert d["status"] == "checked" and d["original_format"] == "txt" and d["uploaded_by"] == "Оператор"
+    # файл договора разобран и дописан к документам договора — участвует в ответах (ревью сайта 29.10.2026)
+    assert d["status"] == "ready" and d["original_format"] == "txt" and d["uploaded_by"] == "Оператор"
+    kit_doc = f"c01.{d['id']}"
+    assert any(x.doc_id == kit_doc for x in svc.kit.clauses("c01"))
+    cl = c.get(f"/api/documents/{d['id']}/clauses")        # просмотр пунктов загрузки на странице «Документы»
+    assert cl.status_code == 200 and cl.json()["total"] >= 1
     assert d["group_id"] == "gk9" and d["uploaded_at"] and len(d["sha256"]) == 64
     assert (tmp / d["source_path"]).is_file()                  # файл — в data/derived/uploads (вне git)
     assert "Памятка" not in str(d["warnings"])                  # текста документа в ответе нет
@@ -132,3 +137,51 @@ def test_import_kit_runs_in_background_without_texts():
     rep = st["report"]["contracts"]["c01"]
     assert rep == {"group_id": "gk9", "status": "ok", "clauses": 7, "documents": 1, "warnings": 1}
     assert "текст предупреждения" not in str(st)
+
+
+def _wait_import(c):
+    for _ in range(200):
+        st = c.get("/api/documents/import-kit").json()
+        if st["state"] != "running":
+            return st
+        time.sleep(0.05)
+    return st
+
+
+def test_import_kit_builds_new_file_and_swaps_atomically():
+    """Ревью 29.10.2026 п. 1: импорт из интерфейса собирает базу во временный файл и подменяет её атомарно — пока идёт
+    сборка, рабочая база цела; после — тот же объект хранилища видит новый комплект; сбой не трогает прежнюю базу."""
+    import tempfile
+    from pathlib import Path
+
+    from dms_core.store.db import KitStore
+    from fixtures.synth_kit import make_parsed
+
+    tmp = Path(tempfile.mkdtemp())
+    live = KitStore(tmp / "kit.sqlite")
+    live.save(make_parsed("c01"))
+    seen = {}
+
+    def ingest(root, store, previous=None):
+        seen["store_path"], seen["previous"] = store.path, previous
+        store.save(make_parsed("c02"))
+        seen["live_during"] = [c.id for c in live.contracts()]   # рабочая база во время сборки
+        return {"contracts": {"c02": {"status": "ok"}}, "groups": {}, "statuses": {}, "seconds": 0}
+
+    c, _svc, _ = make_client(engine=FakeEngine(), ingest_fn=ingest, kit_root=tmp, kit=live)
+    assert c.post("/api/documents/import-kit").status_code == 202
+    assert _wait_import(c)["state"] == "done"
+    assert seen["store_path"].name == "kit.sqlite.tmp" and seen["previous"] is live
+    assert seen["live_during"] == ["c01"]
+    assert [x.id for x in live.contracts()] == ["c02"] and live.path == tmp / "kit.sqlite"
+    assert not (tmp / "kit.sqlite.tmp").exists()
+
+    def broken(root, store, previous=None):
+        store.save(make_parsed("c01"))
+        raise RuntimeError("сбой посреди импорта")
+
+    c2, _, _ = make_client(engine=FakeEngine(), ingest_fn=broken, kit_root=tmp, kit=live)
+    assert c2.post("/api/documents/import-kit").status_code == 202
+    assert _wait_import(c2)["state"] == "error"
+    assert [x.id for x in live.contracts()] == ["c02"]   # прежняя база цела
+    live.close()

@@ -34,6 +34,7 @@ from typing import Any
 from lxml import etree
 
 from dms_core.io.errors import InputError
+from dms_core.io.zipguard import MAX_PART_UNPACKED, PartReader
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -42,8 +43,9 @@ V = "urn:schemas-microsoft-com:vml"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 NS = {"w": W, "r": R, "a": A, "v": V, "mc": MC}
 
-# Защита от «бомб»: docx — тоже zip. Предел распакованного размера частей, которые читаем.
-MAX_PART_BYTES = 200 * 2**20
+# Защита от «бомб»: docx — тоже zip. Пределы части, суммы и степени сжатия — общие (io/zipguard.py, w16-sec);
+# части читаются потоком с обрывом при превышении.
+MAX_PART_BYTES = MAX_PART_UNPACKED
 
 
 def q(tag: str) -> str:
@@ -363,7 +365,7 @@ def _footnotes(xml: bytes | None) -> dict[str, str]:
     return res
 
 
-def _image_hashes(z: zipfile.ZipFile) -> dict[str, str]:
+def _image_hashes(z: PartReader) -> dict[str, str]:
     """rId картинки → первые 8 знаков sha1 её байтов (одинаковые иконки дают одинаковый маркер)."""
     try:
         rels = etree.fromstring(z.read("word/_rels/document.xml.rels"))
@@ -404,14 +406,14 @@ def _icons(el: Any, images: dict[str, str]) -> list[str]:
     return out
 
 
-def _read_part(z: zipfile.ZipFile, name: str) -> bytes | None:
+def _read_part(z: PartReader, name: str) -> bytes | None:
+    """Часть пакета потоком в пределах zipguard (None — части нет); превышение — DocxError too_large."""
     try:
-        info = z.getinfo(name)
+        return z.read(name)
     except KeyError:
         return None
-    if info.file_size > MAX_PART_BYTES:
-        raise DocxError(f"Файл слишком большой после распаковки (часть {name}): похоже на повреждённый docx.")
-    return z.read(info)
+    except InputError as e:
+        raise DocxError(e.message, e.code) from None
 
 
 def _blocks(parent: Any) -> Iterator[Any]:
@@ -427,7 +429,11 @@ def _blocks(parent: Any) -> Iterator[Any]:
 
 def read_docx(path: Path | str) -> DocxDoc:
     try:
-        with zipfile.ZipFile(path) as z:
+        with zipfile.ZipFile(path) as zf:
+            try:
+                z = PartReader(zf, "DOCX")
+            except InputError as e:
+                raise DocxError(e.message, e.code) from None
             document = _read_part(z, "word/document.xml")
             if document is None:
                 raise DocxError("В файле нет word/document.xml: это не документ Word (docx).")

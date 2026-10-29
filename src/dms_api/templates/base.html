@@ -17,24 +17,27 @@
   <a class="skip" href="#main">{{ t.skip }}</a>
   <header class="top">
     <div class="wrap top__in">
-      <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"></span><span>{{ t.app_name }}</span></a>
-      <p class="brand__tag">{{ t.tagline }}</p>
+      {# Слева вверху — словесный знак команды «Justmedit», затем название продукта. #}
+      <a class="brand" href="/" aria-label="{{ t.team }} · {{ t.app_name }}"><span class="brand__word">{{ t.team }}</span><span class="brand__sep" aria-hidden="true"></span><span class="brand__name">{{ t.app_name }}</span></a>
+      <span class="brand__gap" aria-hidden="true"></span>
       <nav class="nav" aria-label="{{ t.nav.aria }}">
         <a href="/" {% if active == "chat" %}aria-current="page"{% endif %}>{{ t.nav.chat }}</a>
         <a href="/documents" {% if active == "documents" %}aria-current="page"{% endif %}>{{ t.nav.documents }}</a>
+        <a href="/settings" {% if active == "settings" %}aria-current="page"{% endif %}>{{ t.nav.settings }}</a>
         <a href="/about" {% if active == "about" %}aria-current="page"{% endif %}>{{ t.nav.about }}</a>
         <button class="theme" type="button" id="theme-toggle" aria-label="{{ t.theme_toggle }}">☾</button>
       </nav>
     </div>
   </header>
-  <div class="notice" role="note"><div class="wrap">{{ t.notice }} <strong id="mock-banner" class="notice__mock" hidden>{{ t.mock_banner }}</strong></div></div>
+  {# Полоса под шапкой — только в демо-режиме ?mock=1; суть «прототип, только по документам» — коротко в подвале. #}
+  <div class="notice" id="notice" role="note" hidden><div class="wrap"><strong id="mock-banner" class="notice__mock" hidden>{{ t.mock_banner }}</strong></div></div>
   <main id="main" class="wrap main{% block main_class %}{% endblock %}">
     {% block main %}{% endblock %}
   </main>
   <footer class="foot">
     <div class="wrap foot__in">
-      <p><strong>{{ t.footer.limits_title }}</strong> {{ t.footer.limits }}</p>
-      <p>{{ t.footer.engine }} {{ versions.engine }} · {{ t.footer.prompt }} {{ versions.prompt }} · {{ t.footer.model }}: {{ versions.llm }}</p>
+      <p>{{ t.footer.short }}</p>
+      <p class="foot__meta">{{ t.footer.team }} <span class="foot__team">{{ t.team }}</span> · {{ t.footer.engine }} {{ versions.engine }} · {{ t.footer.model }}: {{ versions.llm }}</p>
     </div>
   </footer>
 </body>

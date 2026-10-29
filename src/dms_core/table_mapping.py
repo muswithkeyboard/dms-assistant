@@ -328,8 +328,11 @@ def _docx_grid(path: Path) -> list[Rows]:
     from .io.docx_reader import NS, _blocks, q, read_docx
 
     doc = read_docx(path)
+    from .io.zipguard import PartReader
+
+    # та же защита от zip-бомбы, что у read_docx (io/zipguard.py): часть читается потоком в пределах
     with zipfile.ZipFile(path) as z:
-        body = etree.fromstring(z.read("word/document.xml")).find("w:body", NS)
+        body = etree.fromstring(PartReader(z, "DOCX").read("word/document.xml")).find("w:body", NS)
     tbls = [el for el in _blocks(body)] if body is not None else []
     tbls = [el for el in tbls if el.tag == q("tbl")]
     out: list[Rows] = []

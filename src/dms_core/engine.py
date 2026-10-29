@@ -14,15 +14,17 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from .constants import AnswerMode, Confidence, Label, Scenario, StatementKind
-from .schemas import Answer, AnswerContext, ChatContext, Citation, LlmInfo, PerContract, Statement
+from .constants import CLARIFY_OPTIONS_MAX, AnswerMode, Confidence, Label, Scenario, StatementKind
+from .schemas import Answer, AnswerContext, ChatContext, ChatReply, Citation, LlmInfo, PerContract, Statement
 
 log = logging.getLogger(__name__)
+_PROGRAM_Q = re.compile(r"программ", re.IGNORECASE)   # уточняющий вопрос о программе (required_facts.yaml)
 
 MAX_PARALLEL_CONTRACTS = 5     # ГК 3 — 5 договоров: все параллельно (план §14: p95 контекста ГК ≤ 45 с)
 
@@ -36,14 +38,23 @@ def _store(store: Any) -> Any:
 
 
 def contracts_of(context: ChatContext, store: Any) -> list[str]:
-    """Договоры контекста чата. Контекст «договор» — ровно он; «ГК» — все договоры группы."""
+    """Договоры контекста чата. Контекст «договор» — ровно он; «ГК» — все договоры группы, а если в чате выбрана
+    программа — только договоры, где она есть: застрахованный с этой программой — сотрудник этих юрлиц, и спрашивать
+    программу по остальным договорам незачем (замечание пользователя 29.10.2026). Программы нет ни в одном договоре
+    группы — все договоры, как раньше (программа уточнится в ответе)."""
     if context.contract_id:
         store.contract(context.contract_id)          # KeyError, если договор не загружен
         return [context.contract_id]
     if context.group_id:
-        ids = [c.id for c in store.contracts(context.group_id)]
+        cards = store.contracts(context.group_id)
+        ids = [c.id for c in cards]
         if not ids:
             raise KeyError(f"в группе {context.group_id} нет загруженных договоров")
+        if context.program:
+            want = _norm(context.program)
+            own = [c.id for c in cards if any(_norm(p.name) == want for p in (c.programs or []))]
+            if own:
+                return own
         return ids
     raise ValueError("контекст чата не выбран: нужна группа компаний или договор")
 
@@ -146,10 +157,14 @@ def _one_contract(llm: Any, cid: str, question: str, route: Any, context: ChatCo
     from .citations import verify
     from .scenarios.sc01_refusal import decide_label
 
-    program = program_for(cid, context.program or route.slots.get("program"), store)
+    given = context.program or route.slots.get("program")
+    program = program_for(cid, given, store)
     slots = {k: v for k, v in route.slots.items() if k not in ("program", "contract")}
     if program:
         slots["program"] = program
+    elif given:
+        # программа задана, но у этого договора такой нет — вопрос о программе скажет об этом прямо (ADR 0019)
+        slots["program_not_found"] = str(given)
     if clinic_pick:
         # выбор менеджера (ADR 0010): id строки перечня этого договора или "none" — guided проверяет и учитывает
         slots["clinic_pick"] = clinic_pick
@@ -207,7 +222,7 @@ def _fill_trace(trace: dict, results: list[dict]) -> None:
 
 def answer(question: str, context: ChatContext, *, llm: Any = None, store: Any = None,
            trace: dict | None = None, on_stage: Callable[[str], None] | None = None,
-           clinic_picks: dict[str, str] | None = None) -> Answer:
+           clinic_picks: dict[str, str] | None = None, _assisted: bool = False) -> Answer:
     """trace — необязательный словарь, который движок заполняет следом прогона (eval/runner.py);
     on_stage — обратный вызов стадий подготовки ответа для индикатора в интерфейсе (FR 17): route,
     clarify, contract:<id>, verify:<id>, compose. Сбой обратного вызова ответ не ломает.
@@ -220,6 +235,15 @@ def answer(question: str, context: ChatContext, *, llm: Any = None, store: Any =
     t0 = time.perf_counter()
     stage("route")
     store = _store(store)
+    from .inputcheck import is_gibberish, smalltalk, wrong_layout
+
+    talk = smalltalk(question)
+    if talk is not None:
+        return _not_understood(question, context, None, llm, t0, lead=talk)
+    fixed = wrong_layout(question)
+    if fixed is not None or is_gibberish(question):
+        # не вопрос (случайный набор) или английская раскладка — по документам не ищется (круг 2 ревизии w16)
+        return _not_understood(question, context, fixed, llm, t0)
     from .guided import choose_scenario, engine_mode, fill_slots, llm_slots_enabled
     from .scenarios.clarify import split_missing
     from .scenarios.route import route as do_route
@@ -233,6 +257,20 @@ def answer(question: str, context: ChatContext, *, llm: Any = None, store: Any =
             r.slots = fill_slots(question, r.scenario, r.slots, context, llm, store=store)
     else:
         r = do_route(question, context, llm=llm, store=store)
+    understood = None
+    if mode == "guided" and not _assisted and _weak_route(r):
+        # правила вопрос не поняли — модель-помощник переписывает его в стандартный вид (assist.py, w17); берётся,
+        # только если маршрут стал лучше и не потерял клинику / программу / договор из исходного вопроса
+        from .assist import enabled, rephrase
+
+        if enabled(llm):
+            stage("understand")
+            alt = rephrase(question, llm)
+            if alt:
+                r2 = choose_scenario(alt, context, store=store)
+                if not _weak_route(r2) and all(normalize_slot(r.slots.get(k)) in ("", normalize_slot(r2.slots.get(k)))
+                                               for k in ("clinic", "program", "contract")):
+                    r, question, understood = r2, alt, alt
     narrowed = resolve_contract_slot(r.slots.get("contract"), context, store)
     if context.group_id and not context.contract_id and not narrowed:
         r.slots.pop("contract", None)        # неоднозначный слот не закрывает вопрос «какой договор?»
@@ -245,6 +283,16 @@ def answer(question: str, context: ChatContext, *, llm: Any = None, store: Any =
         trace["slots"] = dict(r.slots)
     # Вопросы пересчитываются после поправки слотов. Блокирующие (без факта нет вывода) — вопрос вместо ответа;
     # остальные — ответ даётся, недостающее — в «что неизвестно» (config/required_facts.yaml, blocking).
+    # ответ на «Какая программа?», которого нет среди программ («омс»): не слот клиники и не тот же вопрос молча
+    from .followup import glued_reply
+
+    glued = glued_reply(question)
+    unknown_program = None
+    if glued and _PROGRAM_Q.search(glued[0]) and not r.slots.get("program") and not context.program:
+        unknown_program = glued[1]
+        if normalize_slot(r.slots.get("clinic")) == normalize_slot(unknown_program):
+            r.slots.pop("clinic", None)
+            r.slots.pop("clinic_exact", None)
     questions, advisory = split_missing(r.scenario, r.slots, context, store=store)
     if mode == "extractive":
         out = extractive(question, context, r.scenario, store, slots=r.slots)
@@ -258,6 +306,20 @@ def answer(question: str, context: ChatContext, *, llm: Any = None, store: Any =
                      confidence=Confidence.need_clarification, questions=questions,
                      mode=AnswerMode.live if llm is not None else AnswerMode.guided)
         out.reply = _reply(out, question, store)
+        if out.reply is not None:
+            out.reply.understood = understood
+        if out.reply is not None and not r.slots.get("program") and not context.program:
+            # «Какая программа?» — варианты кнопками: названия программ договора (ГК — всех договоров), только
+            # когда вопрос о программе задан (required_facts.yaml) и программ немного
+            from .scenarios.route import _programs
+            progs = _programs(context, store)
+            if 1 < len(progs) <= CLARIFY_OPTIONS_MAX and any(_PROGRAM_Q.search(q) for q in questions):
+                out.reply.options = progs
+            if unknown_program and any(_PROGRAM_Q.search(q) for q in questions):
+                from .compose import _reply_texts
+
+                out.reply.lead = _reply_texts()["lead_unknown_program"].format(
+                    text=unknown_program, question=out.reply.lead)
         out.processing_ms = int(1000 * (time.perf_counter() - t0))
         return out
 
@@ -306,6 +368,51 @@ def answer(question: str, context: ChatContext, *, llm: Any = None, store: Any =
         out.mode = AnswerMode.guided
     # ответ в чате — после выбора клиники и неблокирующих уточнений (ADR 0014)
     out.reply = _reply(out, question, store)
+    if out.reply is not None:
+        out.reply.understood = understood
+    if mode == "guided" and not _assisted and understood is None and not _found(out):
+        # по вопросу в документах ничего не нашлось (правила взяли разговорное слово за услугу: «к лору») — один
+        # повтор с вопросом, переписанным моделью-помощником; берётся, только если нашлись пункты (ADR 0015)
+        from .assist import enabled, rephrase
+
+        alt = rephrase(question, llm) if enabled(llm) else None
+        if alt:
+            again = answer(alt, context, llm=llm, store=store, trace=trace, on_stage=on_stage,
+                           clinic_picks=clinic_picks, _assisted=True)
+            if _found(again) and again.reply is not None:
+                again.reply.understood = alt
+                again.processing_ms = int(1000 * (time.perf_counter() - t0))
+                return again
+    out.processing_ms = int(1000 * (time.perf_counter() - t0))
+    return out
+
+
+def _found(out: Answer) -> bool:
+    """В ответе есть хотя бы одно проверенное утверждение (по договору или по договорам группы)."""
+    return bool(out.statements) or any(pc.statements for pc in out.per_contract)
+
+
+def _weak_route(r: Any) -> bool:
+    """Правила вопрос не поняли: общий сценарий или нет ни услуги, ни вида помощи, ни клиники."""
+    return r.scenario == Scenario.general or not any(r.slots.get(k) for k in ("service", "care_type", "clinic"))
+
+
+def normalize_slot(value: Any) -> str:
+    return _norm(str(value or "")).strip("«»\"' ")
+
+
+def _not_understood(question: str, context: ChatContext, fixed: str | None, llm: Any, t0: float,
+                    lead: str | None = None) -> Answer:
+    """Ответ на ввод, который не вопрос: реплика («привет» — lead из smalltalk), «не понял вопрос» с примером или, при
+    английской раскладке, тот же вопрос по-русски кнопкой (reply.options). Документы не просматривались — уверенность «данных недостаточно»."""
+    from .compose import _reply_texts, sentences
+
+    t = _reply_texts()
+    lead = lead or (t["lead_wrong_layout"].format(text=fixed) if fixed else t["lead_not_understood"])
+    out = Answer(scenario=Scenario.general, context=_answer_context(context), summary=sentences(lead)[0],
+                 confidence=Confidence.insufficient,
+                 mode=AnswerMode.live if llm is not None else AnswerMode.guided)
+    out.reply = ChatReply(lead=lead, options=[fixed] if fixed else [], service=True)
     out.processing_ms = int(1000 * (time.perf_counter() - t0))
     return out
 

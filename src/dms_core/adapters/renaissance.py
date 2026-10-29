@@ -27,6 +27,7 @@ from lxml import etree
 
 from ..constants import Insurer
 from ..io.docx_reader import Cell, DocxDoc, read_docx
+from ..io.zipguard import read_part
 from ..kit import KitContract
 from ..schemas import CareMatrix, Clause, ClinicRow, Contract, Franchise, Payment, Program
 from .base import ParsedContract, abs_path, files_of, make_document, text_hash
@@ -157,7 +158,7 @@ def _vml_icons(path: Path) -> dict[tuple[int, int], list[list[str]]]:
     out: dict[tuple[int, int], list[list[str]]] = {}
     with zipfile.ZipFile(path) as z:
         try:
-            rels = etree.fromstring(z.read("word/_rels/document.xml.rels"))
+            rels = etree.fromstring(read_part(z, "word/_rels/document.xml.rels"))
         except KeyError:
             return out
         img: dict[str, str] = {}
@@ -167,10 +168,10 @@ def _vml_icons(path: Path) -> dict[tuple[int, int], list[list[str]]]:
                 continue
             p = target.lstrip("/") if target.startswith(("word/", "/word/")) else "word/" + target
             try:
-                img[rel.get("Id")] = f"[icon:{hashlib.sha1(z.read(p)).hexdigest()[:8]}]"
+                img[rel.get("Id")] = f"[icon:{hashlib.sha1(read_part(z, p)).hexdigest()[:8]}]"
             except KeyError:
                 continue
-        body = etree.fromstring(z.read("word/document.xml")).find(f"{W}body")
+        body = etree.fromstring(read_part(z, "word/document.xml")).find(f"{W}body")
     ti = -1
     for el in body:
         if el.tag != f"{W}tbl":

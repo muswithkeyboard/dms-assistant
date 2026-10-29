@@ -1,9 +1,9 @@
 """Чтение xlsx (docs/CONTRACTS.md §2): openpyxl read-only, значения ячеек как строки, многострочные ячейки — как
 есть (с переводами строк: в ГК 3 условие «30 км от МКАД» спрятано в многострочной ячейке, docs/facts/kit/gk3.md).
 
-Защита от zip-бомбы перенесена из Justmedit (reference/justmedit-code/table.py, _check_xlsx): до разбора архив
-открывается, частей не больше MAX_XLSX_PARTS, сумма объявленных распакованных размеров не больше max_unpacked
-(zipfile не выдаёт больше объявленного размера части, поэтому сумма ограничивает и фактическую распаковку).
+Защита от zip-бомбы — общая проверка io/zipguard.check_zip (w16-sec): до разбора по оглавлению архива — число
+частей, размер части, сумма размеров (не больше max_unpacked) и степень сжатия; openpyxl читает пакет сам, а zipfile
+не выдаёт больше объявленного размера части (и сверяет CRC), поэтому проверка оглавления ограничивает и распаковку.
 """
 from __future__ import annotations
 
@@ -12,19 +12,20 @@ import zipfile
 from pathlib import Path
 
 from dms_core.io.errors import InputError
+from dms_core.io.zipguard import MAX_TOTAL_UNPACKED, MAX_ZIP_PARTS, check_zip
 
 # Каталог ЛПУ ГК 1 — 2181 часть (по листу на регион), ~54 МБ распакованного; предел с запасом.
-MAX_XLSX_PARTS = 10_000
+MAX_XLSX_PARTS = MAX_ZIP_PARTS
 
 
 def _check_xlsx(path: Path, max_unpacked: int | None) -> None:
     try:
         with zipfile.ZipFile(path) as z:
-            infos = z.infolist()
+            infos = check_zip(z, "XLSX")
     except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, ValueError) as e:
+        if isinstance(e, InputError):
+            raise
         raise InputError("bad_file", "Файл XLSX повреждён или это не XLSX.") from e
-    if len(infos) > MAX_XLSX_PARTS:
-        raise InputError("too_large", f"В архиве XLSX больше {MAX_XLSX_PARTS} частей.")
     if max_unpacked is not None:
         total = sum(i.file_size for i in infos)
         if total > max_unpacked:
@@ -48,7 +49,7 @@ def _cell(v: object) -> str | None:
     return s if s != "" else None
 
 
-def read_xlsx(path: Path | str, max_unpacked: int = 200 * 2**20) -> dict[str, list[list[str | None]]]:
+def read_xlsx(path: Path | str, max_unpacked: int = MAX_TOTAL_UNPACKED) -> dict[str, list[list[str | None]]]:
     """Лист → строки (списки значений ячеек). Хвостовые пустые ячейки строки и хвостовые пустые строки листа
     отбрасываются; пустые строки внутри листа сохраняются (номер строки = индекс + 1)."""
     path = Path(path)

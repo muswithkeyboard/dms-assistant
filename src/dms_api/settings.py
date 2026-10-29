@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     https: bool = False
     trusted_proxies: str = ""
     llm_provider: str = ""
+    # прогрев: пункты и поисковые индексы договоров строятся в фоне при старте (круг 2 ревизии w16) — первый
+    # ответ по ГК не ждёт чтения всех пунктов; 0 — строить при первом вопросе
+    warm: bool = True
 
     @field_validator("trusted_proxies")
     @classmethod

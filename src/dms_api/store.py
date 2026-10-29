@@ -7,7 +7,9 @@ SQLite в data/app/app.sqlite (вне git). Здесь же реестр кли�
 
 Сообщения запроса только дописываются (`add_message`): два ответа подряд не затирают друг друга, даже если
 параллельно идёт шаг автомата (save_request пишет карточку и черновики, а из сообщений — только новые).
-Тексты документов здесь не хранятся: у загруженного файла — только метаданные Document.
+Тексты документов здесь не хранятся: у загруженного файла — только метаданные Document. Исключение — вложения чата
+(ADR 0016): пункты прикреплённого к чату документа хранятся здесь (attachment_clauses), чтобы отвечать по нему и
+открывать пункт по ссылке; база — в data/app/, вне репозитория; в журнал тексты не пишутся.
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ from dms_core.constants import CLIENT_CONTRACT_PREFIX, CLIENT_GROUP_PREFIX, PROF
 from dms_core.schemas import (
     Chat,
     ChatContext,
+    Clause,
     ClientContract,
     ClientFile,
     ClientGroup,
@@ -82,6 +85,19 @@ MIGRATIONS: list[str] = [
     """
     CREATE TABLE profile_uses (profile_id TEXT NOT NULL, contract_id TEXT NOT NULL,
                                PRIMARY KEY (profile_id, contract_id));
+    """,
+    # 6: вложения чата (ADR 0016) — документ принадлежит чату, его пункты, активное вложение чата; настройки сервиса
+    # (ключ → значение JSON)
+    """
+    CREATE TABLE chat_attachments (id TEXT PRIMARY KEY,
+                                   chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                                   ord INTEGER NOT NULL, sha256 TEXT NOT NULL, body TEXT NOT NULL);
+    CREATE INDEX chat_attachments_chat ON chat_attachments(chat_id, ord);
+    CREATE TABLE attachment_clauses (attachment_id TEXT NOT NULL REFERENCES chat_attachments(id) ON DELETE CASCADE,
+                                     ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (attachment_id, ord));
+    CREATE TABLE chat_active_attachment (chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+                                         attachment_id TEXT NOT NULL REFERENCES chat_attachments(id) ON DELETE CASCADE);
+    CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """,
 ]
 
@@ -456,3 +472,106 @@ class AppStore:
             p = InsurerProfile.model_validate_json(row[0])
             p.used += 1
             conn.execute("UPDATE insurer_profiles SET body = ? WHERE id = ?", (p.model_dump_json(), p.id))
+
+    # ------------------------------------------------------------------ вложения чата (ADR 0016)
+
+    def add_attachment(self, chat_id: str, attachment_id: str, sha256: str, body: dict,
+                       clauses: list[Clause]) -> None:
+        """Вложение чата и его пункты одной транзакцией (body — карточка вложения: документ, куда добавлен)."""
+        with self._tx() as conn:
+            if conn.execute("SELECT 1 FROM chats WHERE id = ?", (chat_id,)).fetchone() is None:
+                raise KeyError(chat_id)
+            ord_ = conn.execute("SELECT COALESCE(MAX(ord), 0) + 1 FROM chat_attachments").fetchone()[0]
+            conn.execute("INSERT INTO chat_attachments(id, chat_id, ord, sha256, body) VALUES (?,?,?,?,?)",
+                         (attachment_id, chat_id, ord_, sha256, json.dumps(body, ensure_ascii=False)))
+            conn.executemany("INSERT INTO attachment_clauses(attachment_id, ord, body) VALUES (?,?,?)",
+                             [(attachment_id, i, c.model_dump_json()) for i, c in enumerate(clauses)])
+
+    def save_attachment(self, attachment_id: str, body: dict) -> None:
+        with self._tx() as conn:
+            cur = conn.execute("UPDATE chat_attachments SET body = ? WHERE id = ?",
+                               (json.dumps(body, ensure_ascii=False), attachment_id))
+            if cur.rowcount == 0:
+                raise KeyError(attachment_id)
+
+    def attachments(self, chat_id: str) -> list[dict]:
+        """Карточки вложений чата в порядке загрузки (без пунктов)."""
+        return [json.loads(r[0]) for r in
+                self._all("SELECT body FROM chat_attachments WHERE chat_id = ? ORDER BY ord", (chat_id,))]
+
+    def attachment(self, attachment_id: str) -> tuple[str, dict]:
+        """(чат вложения, карточка); KeyError — нет такого."""
+        row = self._one("SELECT chat_id, body FROM chat_attachments WHERE id = ?", (attachment_id,))
+        if row is None:
+            raise KeyError(attachment_id)
+        return row[0], json.loads(row[1])
+
+    def attachment_by_sha(self, chat_id: str, sha256: str) -> dict | None:
+        """Тот же файл, уже прикреплённый к этому чату (повторная загрузка не плодит копий)."""
+        row = self._one("SELECT body FROM chat_attachments WHERE chat_id = ? AND sha256 = ? ORDER BY ord DESC "
+                        "LIMIT 1", (chat_id, sha256))
+        return json.loads(row[0]) if row else None
+
+    def attachment_clauses(self, attachment_id: str) -> list[Clause]:
+        return [Clause.model_validate_json(r[0]) for r in
+                self._all("SELECT body FROM attachment_clauses WHERE attachment_id = ? ORDER BY ord",
+                          (attachment_id,))]
+
+    def delete_attachment(self, chat_id: str, attachment_id: str) -> dict:
+        """Удалить вложение чата (карточку, пункты, отметку «активное»); вложение другого чата — KeyError.
+        Возвращает удалённую карточку (по ней сервис удаляет файл)."""
+        with self._tx() as conn:
+            row = conn.execute("SELECT chat_id, body FROM chat_attachments WHERE id = ?", (attachment_id,)).fetchone()
+            if row is None or row[0] != chat_id:
+                raise KeyError(attachment_id)
+            conn.execute("DELETE FROM chat_active_attachment WHERE chat_id = ? AND attachment_id = ?",
+                         (chat_id, attachment_id))
+            conn.execute("DELETE FROM attachment_clauses WHERE attachment_id = ?", (attachment_id,))
+            conn.execute("DELETE FROM chat_attachments WHERE id = ?", (attachment_id,))
+            return json.loads(row[1])
+
+    def delete_chat(self, chat_id: str) -> list[str]:
+        """Удалить чат целиком одной транзакцией: обращения, сообщения, черновики, вложения и их пункты, отметку
+        «активное вложение». Нет чата — KeyError. Возвращает id удалённых вложений (по ним сервис удаляет файлы)."""
+        with self._tx() as conn:
+            if conn.execute("SELECT 1 FROM chats WHERE id = ?", (chat_id,)).fetchone() is None:
+                raise KeyError(chat_id)
+            atts = [r[0] for r in conn.execute("SELECT id FROM chat_attachments WHERE chat_id = ?", (chat_id,))]
+            reqs = "SELECT id FROM requests WHERE chat_id = ?"
+            conn.execute(f"DELETE FROM drafts WHERE request_id IN ({reqs})", (chat_id,))
+            conn.execute(f"DELETE FROM messages WHERE request_id IN ({reqs})", (chat_id,))
+            conn.execute("DELETE FROM requests WHERE chat_id = ?", (chat_id,))
+            conn.execute("DELETE FROM chat_active_attachment WHERE chat_id = ?", (chat_id,))
+            conn.execute("DELETE FROM attachment_clauses WHERE attachment_id IN "
+                         "(SELECT id FROM chat_attachments WHERE chat_id = ?)", (chat_id,))
+            conn.execute("DELETE FROM chat_attachments WHERE chat_id = ?", (chat_id,))
+            conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+            return atts
+
+    def active_attachment(self, chat_id: str) -> str | None:
+        row = self._one("SELECT attachment_id FROM chat_active_attachment WHERE chat_id = ?", (chat_id,))
+        return row[0] if row else None
+
+    def set_active_attachment(self, chat_id: str, attachment_id: str | None) -> None:
+        """Активное вложение чата (вопросы отвечаются по нему); None — снова по договору чата. Вложение — только
+        этого чата (ADR 0005): чужое — KeyError."""
+        with self._tx() as conn:
+            if attachment_id is None:
+                conn.execute("DELETE FROM chat_active_attachment WHERE chat_id = ?", (chat_id,))
+                return
+            row = conn.execute("SELECT chat_id FROM chat_attachments WHERE id = ?", (attachment_id,)).fetchone()
+            if row is None or row[0] != chat_id:
+                raise KeyError(attachment_id)
+            conn.execute("INSERT OR REPLACE INTO chat_active_attachment(chat_id, attachment_id) VALUES (?, ?)",
+                         (chat_id, attachment_id))
+
+    # ------------------------------------------------------------------ настройки сервиса (ключ → значение)
+
+    def setting(self, key: str, default: object = None) -> object:
+        row = self._one("SELECT value FROM app_settings WHERE key = ?", (key,))
+        return json.loads(row[0]) if row else default
+
+    def save_setting(self, key: str, value: object) -> None:
+        with self._tx() as conn:
+            conn.execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES (?, ?)",
+                         (key, json.dumps(value, ensure_ascii=False)))

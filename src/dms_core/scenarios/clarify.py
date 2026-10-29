@@ -1,7 +1,7 @@
 """Недостающие обязательные факты → уточняющие вопросы (`docs/rules.md` п. 2, план §6.6–6.8).
 
 Список фактов и тексты вопросов — только из config/required_facts.yaml. Условия `when`:
-- `context_is_group` — чат по всей ГК, договор не выбран;
+- `context_is_group` — чат по всей ГК, договор не выбран (и программа чата не сводит ГК к одному договору);
 - `program_affects_answer` — программа неизвестна, а у договора (или хотя бы у одного договора ГК) программ больше
   одной; если хранилище недоступно — считаем, что влияет (лучше спросить, чем перенести условия программы);
 - `refusal_mentioned` — в обращении сообщается об отказе (слот `refusal`);
@@ -50,7 +50,18 @@ def _condition(when: str | None, slots: dict[str, Any], context: ChatContext, st
     if not when:
         return True
     if when == "context_is_group":
-        return context.contract_id is None and context.group_id is not None
+        if context.contract_id is not None or context.group_id is None:
+            return False
+        # программа чата есть ровно в одном договоре ГК — договор известен (ADR 0019), «какое юрлицо?» не спрашиваем
+        if context.program:
+            try:
+                from ..engine import contracts_of
+                from ..tools._common import default_store
+
+                return len(contracts_of(context, store or default_store())) != 1
+            except (KeyError, ValueError, OSError, sqlite3.Error):
+                return True
+        return True
     if when == "program_affects_answer":
         n = _program_count(context, store)
         return n is None or n > 1

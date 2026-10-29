@@ -4,7 +4,7 @@
 (function () {
   "use strict";
   var D = window.DMS, T = D.T, el = D.el, $ = D.$, clear = D.clear;
-  var state = { groups: [], contractById: {}, docsCache: {} };
+  var state = { groups: [], contractById: {}, docsCache: {}, hitRef: null };
   // Порядок статусов готовности (ТЗ п. 7.1): получен → текст извлечён → полнота проверена → индексирован → готов.
   var PIPELINE = ["received", "extracted", "checked", "indexed", "ready"];
 
@@ -37,7 +37,7 @@
           var sub = [c.number ? "№ " + c.number : null, T("insurers." + (c.insurer || "unknown"))].filter(Boolean).join(" · ");
           inner.appendChild(branch(c.legal_entity, sub, { contract_id: c.id }, c.id));
         });
-        tree.appendChild(el("details", { class: "tree__group", open: true }, [el("summary", null, [el("strong", { text: g.name })]), inner]));
+        tree.appendChild(el("details", { class: "tree__group", open: true }, [el("summary", null, [el("span", { class: "ico ico--sm ico--building tree__ico", "aria-hidden": "true" }), el("strong", { text: g.name })]), inner]));
       });
       fillUploadSelects();
     });
@@ -69,6 +69,7 @@
         list.appendChild(el("li", null, [el("button", { type: "button", class: "tree__doc", "data-doc": doc.id, "aria-current": D.readHash().doc === doc.id ? "true" : null, on: { click: function () { showDoc(doc.id); } } }, [
           el("span", { class: "tree__title", text: doc.title }),
           el("span", { class: "tree__chips" }, [D.docStatusChip(doc.status),
+            doc.uploaded_by === "chat" ? D.chip(T("attach.from_chat"), "chip--cond") : null,
             (doc.warnings || []).length ? D.chip(T("docs.warnings_n", { n: doc.warnings.length }), "chip--warn chip--bang") : null])
         ])]));
       });
@@ -148,7 +149,7 @@
       }
       body.appendChild(kv([
         [f("doc_type"), T("doc_types." + doc.doc_type)], [f("original_format"), String(doc.original_format || "").toUpperCase()],
-        [f("uploaded_by"), doc.uploaded_by], [f("uploaded_at"), D.fmtDateTime(doc.uploaded_at)],
+        [f("uploaded_by"), doc.uploaded_by === T("docs.upload_by_default") ? T("docs.upload_by_placeholder") : doc.uploaded_by], [f("uploaded_at"), D.fmtDateTime(doc.uploaded_at)],
         [f("precedence_level"), doc.precedence_level === null || doc.precedence_level === undefined ? null : String(doc.precedence_level)],
         [f("source_path"), doc.source_path], [f("sha256"), doc.sha256 ? el("code", { text: String(doc.sha256).slice(0, 16) + "…" }) : null]
       ], "doc__meta"));
@@ -167,11 +168,14 @@
       var fid = "cl-filter-" + doc.id;
       var filter = el("input", { type: "search", id: fid, autocomplete: "off" });
       var ol = el("ol", { class: "clauses__list" });
+      // Переход из чата (#doc=…&clause=…&ref=…): подсвечиваем пункт по id ссылки цитаты — номер пункта в документе
+      // бывает не один (ревизия w16); id не нашёлся — по номеру.
+      var byRef = !!state.hitRef && list.some(function (c) { return c.id === state.hitRef; });
       function render() {
         var q = filter.value.trim().toLowerCase();
         clear(ol);
         list.filter(function (c) { return !q || (c.number || "").toLowerCase().indexOf(q) === 0 || (c.text || "").toLowerCase().indexOf(q) >= 0; }).slice(0, 400).forEach(function (c) {
-          ol.appendChild(clauseItem(c, clauseNumber && c.number === clauseNumber));
+          ol.appendChild(clauseItem(c, byRef ? c.id === state.hitRef : clauseNumber && c.number === clauseNumber));
         });
         if (!ol.children.length) { ol.appendChild(el("li", { class: "muted", text: T("docs.clause_not_found") })); }
       }
@@ -236,6 +240,7 @@
     fd.append("group_id", $("up-group").value);
     fd.append("contract_id", $("up-contract").value);
     if ($("up-type").value) { fd.append("doc_type", $("up-type").value); }
+    // Пустое поле — в API уходит служебное значение «operator» (docs.upload_by_default), на экране — «оператор».
     fd.append("uploaded_by", $("up-by").value.trim() || T("docs.upload_by_default"));
     $("up-send").disabled = true; st.textContent = T("docs.upload_running");
     D.request("POST", "/api/documents", fd).then(function (r) {
@@ -253,6 +258,8 @@
   }
   function importKit() {
     var btn = $("import-kit"), st = $("import-status");
+    // Импорт пересобирает базу всех договоров — только после подтверждения (ревью сайта 29.10.2026)
+    if (!window.confirm(T("docs.import_confirm"))) { return; }
     btn.disabled = true; st.textContent = T("docs.import_running"); showAlert("");
     D.request("POST", "/api/documents/import-kit").then(function (r) {
       btn.disabled = false;
@@ -284,6 +291,7 @@
     loadTree().then(function () {
       var h = D.readHash();
       if (h.doc) {
+        state.hitRef = h.ref || null;
         showDoc(h.doc, h.clause || null);
       }
     });

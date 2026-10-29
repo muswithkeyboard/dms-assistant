@@ -36,6 +36,7 @@ from pydantic import ValidationError
 
 from dms_core import __version__
 from dms_core.config import load_yaml, prompt_version
+from dms_core.followup import clarify_reply, followup_question
 
 log = logging.getLogger("dms.service")
 
@@ -109,6 +110,28 @@ def _err_not_found(what: str) -> ServiceError:
     return ServiceError(404, "not_found", f"{what} не найден. Обновите страницу.")
 
 
+def _lead_sentence(lead: str) -> str:
+    """«Можно при условиях: услуга входит…» → «Можно при условиях — услуга входит…»: в письме после
+    «По документам договора:» второе двоеточие подряд читается плохо."""
+    head, sep, rest = lead.partition(": ")
+    return f"{head} — {rest}" if sep and len(head) <= 40 and "«" not in head else lead
+
+
+def _human_ref(ref: str | None) -> str:
+    """Строка таблицы словами («табл. 7, стр. 87», «лист «Лист1», стр. 57»), как humanRef в chat.js;
+    служебный id («c11.program#t7r87») в письмо не попадает."""
+    if not ref:
+        return ""
+    t = ui_texts()["reply"]
+    m = re.search(r"(?:^|#)t(\d+)r(\d+)$", ref)
+    if m:
+        return t["table_row"].format(t=m.group(1), r=m.group(2))
+    m = re.match(r"^(.+)!\$?[A-Za-z]{1,3}\$?(\d+)$", ref)
+    if m:
+        return t["sheet_row"].format(sheet=m.group(1).strip("'"), r=m.group(2))
+    return "" if re.search(r"[#:!]", ref) or re.fullmatch(r"[\w.-]+", ref) else ref
+
+
 def _text(body: dict, key: str, *, required: bool, limit: int, label: str) -> str | None:
     """Строковое поле тела: тип, пустота, длина — с сообщением по-русски и именем поля."""
     value = body.get(key)
@@ -138,9 +161,25 @@ def _norm_q(s: str) -> str:
 _OOXML_PARTS = {"docx": "word/document.xml", "xlsx": "xl/workbook.xml"}
 # Частей пакета — как у читателя xlsx (io/xlsx_reader.py MAX_XLSX_PARTS = 10 000): каталог ЛПУ ГК 1 — 2181 часть
 # (лист на регион), прежний предел 2000 его отклонял. Защита от zip-бомбы — суммарный объявленный распакованный
-# размер MAX_UNPACKED (zipfile не распакует больше объявленного размера части).
+# размер MAX_UNPACKED (zipfile не распакует больше объявленного размера части), а также размер одной части и степень
+# сжатия — общая проверка dms_core.io.zipguard.check_zip (w16-sec: docx 0,55 МБ → 190 МБ XML проходил прежний предел).
 MAX_ZIP_ENTRIES = 10_000
-MAX_UNPACKED = 200 * 2**20        # распакованный размер пакета (защита от zip-бомбы)
+_VARIANT = re.compile(r"@v\d+$")   # суффикс варианта пункта по программе (onboarding, adapters/zetta)
+ERR_STALE_CHOICE = "После этого ответа уже задан новый вопрос — выберите клинику в последнем ответе."
+ERR_AMBIGUOUS_CLAUSE = "Пункт с этим номером встречается несколько раз — откройте его по ссылке из ответа."
+MAX_UNPACKED = 60 * 2**20         # распакованный размер пакета (защита от zip-бомбы) = zipguard.MAX_TOTAL_UNPACKED
+
+# Вложения чата (ADR 0016): id «att_<hex>», файл — data/app/attachments/ (вне репозитория); настройка сервиса
+# «куда сохранять документ из чата»: chat — только в этом чате (по умолчанию), contract — также в документы договора.
+ATT_PREFIX = "att_"
+SETTING_UPLOAD_TARGET = "chat_upload_target"
+UPLOAD_TARGETS = ("chat", "contract")
+# Типы документа, с которыми документ из чата добавляется к договору; прочие (перечень, правила, каталог) — «other»:
+# такой файл разбирается только на пункты, перечнем клиник или правилами СК он не становится.
+ATTACH_DOC_TYPES = ("program", "contract", "amendment", "memo", "other")
+ERR_ATT_EMPTY = "В файле не нашлось текста: он пустой или это скан без текстового слоя. Загрузите DOCX или TXT."
+ERR_ATT_UNREADABLE = "Файл не удалось прочитать. Проверьте, что он открывается, и загрузите снова."
+ERR_ATT_CONTRACT = "Выберите договор, в документы которого добавить файл."
 
 
 def sniff_format(filename: str, data: bytes) -> str:
@@ -167,6 +206,14 @@ def sniff_format(filename: str, data: bytes) -> str:
         if sum(i.file_size for i in infos) > MAX_UNPACKED:
             raise ServiceError(413, "payload_too_large", f"Файл в распакованном виде больше {MAX_UNPACKED // 2**20} МБ: "
                                                  "разбейте его на несколько файлов.", "file")
+        from dms_core.io.errors import InputError
+        from dms_core.io.zipguard import check_zip
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                check_zip(z, ext.upper())        # размер одной части и степень сжатия
+        except InputError as e:
+            raise ServiceError(413, "payload_too_large", e.message, "file") from None
         return ext
     if ext == "pdf":
         if not data[:1024].lstrip().startswith(b"%PDF-"):
@@ -292,6 +339,8 @@ class Service:
         # изменения соседнего потока. Словарь растёт по числу запросов процесса — это байты на запрос.
         self._req_locks: dict[str, threading.Lock] = {}
         self._req_locks_guard = threading.Lock()
+        # обращения, по которым сейчас считается ответ (ревью 29.10.2026 п. 5): второй вопрос — 409, а не второй расчёт
+        self._busy: set[str] = set()
         # Таблицы документов договора для экрана разметки (ADR 0012): последние TABLES_CACHE_MAX договоров
         self._tables_cache: dict[str, tuple] = {}
         self._tables_lock = threading.Lock()
@@ -318,11 +367,29 @@ class Service:
 
     @property
     def kit(self) -> Any:
+        # хранилище не задано явно — каждый раз default_store(): появилась база комплекта — откроется она (ревью п. 1)
         if self._kit is None:
             from dms_core.tools._common import default_store
 
-            self._kit = default_store()
+            return default_store()
         return self._kit
+
+    def warm(self) -> int:
+        """Поисковые индексы (и кэш пунктов) всех договоров комплекта — заранее, в пределах CLAUSE_CACHE_MAX;
+        сбой прогрева не мешает сервису (индекс построится при первом вопросе). Возвращает число договоров."""
+        from dms_core.constants import CLAUSE_CACHE_MAX
+        from dms_core.index.search import get_index
+
+        n = total = 0
+        try:
+            for c in self.kit.contracts():
+                total += len(get_index(self.kit, c.id).clauses)
+                if total > CLAUSE_CACHE_MAX:
+                    break                    # дальше кэш не вмещает: остальные строятся при вопросе
+                n += 1
+        except Exception:
+            log.warning("прогрев индексов прерван", exc_info=True)
+        return n
 
     def get_llm(self) -> Any:
         if self.llm_factory is not None:
@@ -423,13 +490,26 @@ class Service:
 
     def clause(self, doc_id: str, number: str | None, path: str | None, ref: str | None,
                chat_id: str | None = None) -> dict:
-        """Пункт или строка клиник для панели «Источники». Поиск — только в договоре этого документа (ADR 0005)."""
+        """Пункт или строка клиник для панели «Источники». Поиск — только в договоре этого документа (ADR 0005).
+        Вложение чата (att_…) — только из своего чата (ADR 0016)."""
+        if doc_id.startswith(ATT_PREFIX):
+            return self._attachment_clause(doc_id, number, ref, chat_id)
         doc = self._parsed_document(doc_id, chat_id)
         cid = doc.contract_id
         if ref:
-            for cl in self.kit.clauses(cid):
-                if cl.id == ref and cl.doc_id == doc_id:
-                    return {"clause": _dump(cl)}
+            # точная ссылка цитаты (Citation.ref): ровно этот пункт. Пункт общей части программы хранится вариантами
+            # «<id>@vN» (по варианту на программу, onboarding/zetta): ссылка без суффикса — вариант программы чата
+            # (иначе первый: текст вариантов один), ссылка с суффиксом, которого нет в базе, — пункт без суффикса.
+            own = [cl for cl in self.kit.clauses(cid) if cl.doc_id == doc_id]
+            exact = next((cl for cl in own if cl.id == ref), None)
+            if exact is not None:
+                return {"clause": _dump(exact)}
+            base = _VARIANT.sub("", ref)
+            variants = [cl for cl in own if _VARIANT.sub("", cl.id) == base]
+            if variants:
+                program = self._chat(chat_id).context.program if chat_id else None
+                pick = next((cl for cl in variants if program and cl.program == program), variants[0])
+                return {"clause": _dump(pick)}
             from dms_core.table_mapping import DERIVED_SUFFIX
 
             # строка матрицы «виды помощи из перечня» (ADR 0013): ссылка — строка перечня + «#care»
@@ -443,10 +523,21 @@ class Service:
         hits = [c for c in self.kit.clause(cid, number=number, path=path) if c.doc_id == doc_id]
         if not hits:
             raise _err_not_found("Пункт")
+        # Один номер у нескольких разных пунктов документа (разделы программ, таблицы): по номеру не угадываем —
+        # панель «Источники» открыла бы чужой пункт. Варианты одного пункта (@vN) — это один пункт.
+        if len({_VARIANT.sub("", c.id) for c in hits}) > 1:
+            raise ServiceError(409, "ambiguous_clause", ERR_AMBIGUOUS_CLAUSE, "number")
         return {"clause": _dump(hits[0])}
 
     def document_clauses(self, doc_id: str, limit: int = 2000, chat_id: str | None = None) -> dict:
         """Пункты документа по порядку — для просмотра на странице оператора (без строк клиник)."""
+        if doc_id.startswith(ATT_PREFIX):
+            _, rows = self._own_attachment(doc_id, chat_id)
+            return {"clauses": [_dump(c) for c in rows[:limit]], "total": len(rows), "truncated": len(rows) > limit}
+        up = self.app.upload(doc_id)
+        if up is not None and up.contract_id:
+            # загрузка оператора, дописанная к документам договора: её пункты — у документа «<договор>.<id загрузки>»
+            doc_id = f"{up.contract_id}.{doc_id}"
         doc = self._parsed_document(doc_id, chat_id)
         rows = [c for c in self.kit.clauses(doc.contract_id) if c.doc_id == doc_id]
         return {"clauses": [_dump(c) for c in rows[:limit]], "total": len(rows), "truncated": len(rows) > limit}
@@ -458,8 +549,10 @@ class Service:
         """Загрузка файла оператором: сигнатура → сохранение в data/derived/uploads (вне git) → извлечение текста →
         проверка полноты → метаданные (кто, когда, источник, формат) и статус ТЗ п. 7.1.
 
-        Индексация отдельного файла в поиск договора не выполняется: разбор договора — целиком адаптером
-        (import-kit), поэтому статус останавливается на «Полнота проверена» с предупреждением."""
+        Файл договора (выбран договор) после проверки разбирается на пункты тем же кодом, что документ из чата
+        (attachment.parse_file), и дописывается к документам договора (KitStore.add_documents, ADR 0016): поиск и
+        ответы его учитывают, статус «Готов» (ревью сайта 29.10.2026: раньше файл сохранялся, но в ответах не
+        участвовал). Файл группы без договора — только сохраняется: условия читаются по договорам (ADR 0005)."""
         from dms_core.constants import DocStatus, DocType
         from dms_core.io.errors import InputError
         from dms_core.kit import classify
@@ -488,7 +581,12 @@ class Service:
             dtype = DocType(classify(filename)[0])
         who = _text({"u": uploaded_by}, "u", required=False, limit=100, label="Кто загрузил") or "operator"
         sha = hashlib.sha256(data).hexdigest()
-        doc_id = f"up_{sha[:12]}"
+        # id и файл — от содержимого ВМЕСТЕ с договором (или ГК, если файл ГК): один и тот же файл в двух договорах —
+        # две записи и два файла, а не замена первой (w16-sec; ADR 0005 — у каждого договора свои документы).
+        # Повторная загрузка того же файла в тот же договор — та же запись. Старые записи «up_<sha[:12]>» остаются
+        # как есть: их id и путь хранятся в записи (source_path).
+        scope = f"contract:{contract_id}" if contract_id else f"group:{group_id}"
+        doc_id = "up_" + hashlib.sha256(f"{scope}\n{sha}".encode()).hexdigest()[:16]
         target = self.data_dir / "derived" / "uploads" / f"{doc_id}.{fmt}"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
@@ -505,9 +603,13 @@ class Service:
                 doc.status = DocStatus.checked
                 if fmt == "docx" and dtype in (DocType.contract, DocType.program) and not stats.get("numbered"):
                     doc.warnings.append("В документе нет автонумерации пунктов: ссылки будут без номеров.")
-                doc.warnings.append("Файл сохранён и проверен, но в ответах не участвует: ответы строятся по "
-                                    "документам комплекта. Чтобы файл учитывался, положите его в папку договора "
-                                    "комплекта и выполните «Импорт комплекта».")
+                if contract_id:
+                    self._upload_to_contract(doc, target, fmt, contract_id)
+                else:
+                    doc.warnings.append("Файл группы сохранён и проверен, но в ответах не участвует: ответы строятся "
+                                        "по договорам. Чтобы файл учитывался, загрузите его в нужный договор.")
+        except ServiceError:
+            raise
         except InputError as e:
             doc.status = DocStatus.error
             doc.warnings.append(e.message)
@@ -518,6 +620,279 @@ class Service:
         self.app.save_upload(doc)
         log.info("upload %s fmt=%s status=%s", doc_id, fmt, doc.status.value)
         return _dump(doc)
+
+    def _upload_to_contract(self, doc: Any, path: Path, fmt: str, contract_id: str) -> None:
+        """Загруженный оператором файл → документ договора «<договор>.<id загрузки>» с пунктами (как документ из чата,
+        ADR 0016): ревизия договора меняется — поиск и кэш пунктов пересобираются; кэши перечня — onboarding.invalidate.
+        Повторная загрузка того же файла в тот же договор — тот же документ, не дубль."""
+        from dms_core import attachment as att
+        from dms_core import onboarding
+        from dms_core.constants import DocStatus
+
+        levels = load_yaml("precedence.yaml")["levels"]
+        kit_id = f"{contract_id}.{doc.id}"
+        clauses = att.parse_file(path, fmt, doc.title, kit_id, contract_id)
+        if not clauses:
+            doc.warnings.append("Текст не разбит на пункты: файл сохранён, но в ответах не участвует.")
+            return
+        kdoc = doc.model_copy(update={
+            "id": kit_id, "status": DocStatus.ready, "precedence_level": levels.get(doc.doc_type.value),
+            "warnings": [("Загружен оператором на странице «Документы». Повторный импорт комплекта (или повторная "
+                          "обработка договора клиента) удаляет этот документ — тогда загрузите его снова.")]})
+        try:
+            self.kit.add_documents(contract_id, [kdoc], clauses)
+        except KeyError:
+            raise ServiceError(422, "contract_not_loaded", ERR_NOT_LOADED) from None
+        except ValueError:
+            pass   # тот же файл в тот же договор уже добавлен — не дублируем
+        onboarding.invalidate(contract_id)
+        doc.status = DocStatus.ready
+        doc.warnings.append(f"Добавлен в документы договора и учитывается в ответах (пунктов: {len(clauses)}). "
+                            "Повторный импорт комплекта удаляет загруженный документ — тогда загрузите его снова.")
+
+    # ---------------------------------------------------------------- настройки сервиса
+
+    def settings(self) -> dict:
+        v = self.app.setting(SETTING_UPLOAD_TARGET, "chat")
+        return {SETTING_UPLOAD_TARGET: v if v in UPLOAD_TARGETS else "chat"}
+
+    def save_settings(self, body: dict) -> dict:
+        unknown = set(body) - {SETTING_UPLOAD_TARGET}
+        if unknown:
+            raise ServiceError(422, "invalid", "Неизвестная настройка.", min(unknown))
+        v = body.get(SETTING_UPLOAD_TARGET)
+        if v not in UPLOAD_TARGETS:
+            raise ServiceError(422, "invalid", "Выберите, где сохранять документы, загруженные в чат.",
+                               SETTING_UPLOAD_TARGET)
+        self.app.save_setting(SETTING_UPLOAD_TARGET, v)
+        log.info("settings %s=%s", SETTING_UPLOAD_TARGET, v)
+        return self.settings()
+
+    # ---------------------------------------------------------------- вложения чата (ADR 0016)
+
+    def _own_attachment(self, attachment_id: str, chat_id: str | None) -> tuple[dict, list]:
+        """Карточка и пункты вложения — только из своего чата: без chat_id или из другого чата — 404 (вложение
+        принадлежит чату, условия не переносятся, ADR 0005)."""
+        try:
+            owner, body = self.app.attachment(attachment_id)
+        except KeyError:
+            raise _err_not_found("Документ") from None
+        if not chat_id or owner != chat_id:
+            raise ServiceError(404, "not_found", "Документ не относится к этому чату.")
+        return body, self.app.attachment_clauses(attachment_id)
+
+    def _attachment_clause(self, attachment_id: str, number: str | None, ref: str | None,
+                           chat_id: str | None) -> dict:
+        _, rows = self._own_attachment(attachment_id, chat_id)
+        if ref:
+            hit = next((c for c in rows if c.id == ref), None)
+            if hit is None:
+                raise _err_not_found("Пункт")
+            return {"clause": _dump(hit)}
+        if not number:
+            raise ServiceError(422, "required", "Укажите номер пункта, путь или ссылку.", "number")
+        hits = [c for c in rows if (c.number or "").strip().rstrip(".") == number.strip().rstrip(".")]
+        if not hits:
+            raise _err_not_found("Пункт")
+        if len(hits) > 1:
+            raise ServiceError(409, "ambiguous_clause", ERR_AMBIGUOUS_CLAUSE, "number")
+        return {"clause": _dump(hits[0])}
+
+    def attachments(self, chat_id: str) -> dict:
+        """Вложения чата (меню «⋯» → «Вложения») и активное — по нему отвечаются вопросы чата."""
+        self._chat(chat_id)
+        active = self.app.active_attachment(chat_id)
+        items = [{**b, "active": b.get("id") == active} for b in self.app.attachments(chat_id)]
+        return {"items": items, "active": active}
+
+    def set_active_attachment(self, chat_id: str, body: dict) -> dict:
+        """{attachment_id: id | null}: вопросы — по вложению или снова по договору чата."""
+        self._chat(chat_id)
+        aid = body.get("attachment_id")
+        if aid is not None and (not isinstance(aid, str) or not aid.startswith(ATT_PREFIX)):
+            raise ServiceError(422, "invalid", "Документ указан неверно.", "attachment_id")
+        try:
+            self.app.set_active_attachment(chat_id, aid)
+        except KeyError:
+            raise ServiceError(404, "not_found", "Документ не относится к этому чату.") from None
+        return self.attachments(chat_id)
+
+    def delete_chat(self, chat_id: str) -> dict:
+        """Удалить чат: обращения, сообщения, черновики писем, вложения (записи, пункты и файлы в data/app/attachments).
+        Пока в чате считается ответ — 409 (обращение занято). Документы, уже добавленные из чата к договору (ADR 0016),
+        остаются у договора — их удаляет повторный импорт."""
+        self._chat(chat_id)
+        with self._req_locks_guard:
+            busy = {r.id for r in self.app.requests(chat_id, "all")} & self._busy if self._busy else set()
+        if busy:
+            raise ServiceError(409, "request_busy", "В этом чате ассистент ещё отвечает. Дождитесь ответа и повторите.")
+        try:
+            atts = self.app.delete_chat(chat_id)
+        except KeyError:
+            raise ServiceError(404, "not_found", "Чат не найден.") from None
+        folder = (self.data_dir / "app" / "attachments").resolve()
+        for aid in atts:
+            for f in folder.glob(f"{aid}.*") if folder.is_dir() else []:
+                if f.resolve().parent == folder:            # только файлы этой папки (без переходов по ссылкам)
+                    with contextlib.suppress(OSError):
+                        f.unlink()
+        log.info("chat deleted %s attachments=%d", chat_id, len(atts))
+        return {"deleted": chat_id}
+
+    def delete_attachment(self, chat_id: str, attachment_id: str) -> dict:
+        """Удалить вложение чата: запись, пункты и файл в data/app/attachments. Документ, уже добавленный к договору
+        (настройка «также в документы договора»), остаётся у договора — его удаляет повторный импорт (ADR 0016).
+        Ответы, которые ссылались на вложение, остаются в чате; превью их ссылок покажет только цитату."""
+        self._chat(chat_id)
+        if not isinstance(attachment_id, str) or not attachment_id.startswith(ATT_PREFIX):
+            raise ServiceError(422, "invalid", "Документ указан неверно.", "attachment_id")
+        try:
+            body = self.app.delete_attachment(chat_id, attachment_id)
+        except KeyError:
+            raise ServiceError(404, "not_found", "Документ не относится к этому чату.") from None
+        folder = (self.data_dir / "app" / "attachments").resolve()
+        for f in folder.glob(f"{attachment_id}.*") if folder.is_dir() else []:
+            if f.resolve().parent == folder:            # только файлы этой папки (без переходов по ссылкам)
+                with contextlib.suppress(OSError):
+                    f.unlink()
+        log.info("attachment deleted %s", attachment_id)
+        return {**self.attachments(chat_id), "deleted": attachment_id, "kept_in_contract": body.get("added_to")}
+
+    def attach(self, chat_id: str, *, filename: str, data: bytes, request_id: str | None = None,
+               contract_id: str | None = None, doc_type: str | None = None) -> dict:
+        """Документ в чат: сигнатура и размер (как у upload) → файл в data/app/attachments → пункты (разбор
+        запасного адаптера) → вложение чата, активное → сообщение ассистента «Документ загружен…». Настройка
+        «также в документы договора» — документ дописывается к договору чата (KitStore.add_documents)."""
+        from dms_core import attachment as att
+        from dms_core.constants import DocStatus, DocType
+        from dms_core.io.errors import InputError
+        from dms_core.kit import classify
+        from dms_core.schemas import Document, Message
+
+        chat = self._chat(chat_id)
+        if not data:
+            raise ServiceError(422, "required", "Выберите файл.", "file")
+        fmt = sniff_format(filename, data)
+        name = clean_filename(filename)
+        if doc_type:
+            if doc_type not in ATTACH_DOC_TYPES:
+                raise ServiceError(422, "invalid", "Неизвестный тип документа.", "doc_type")
+            dtype = DocType(doc_type)
+        else:
+            guess = classify(name)[0]
+            dtype = DocType(guess if guess in ATTACH_DOC_TYPES else "other")
+        target_cid = self._attach_target(chat, contract_id)
+        req = self._attach_request(chat_id, request_id, Path(name).stem)
+        sha = hashlib.sha256(data).hexdigest()
+
+        body = self.app.attachment_by_sha(chat_id, sha)
+        if body is None:
+            aid = ATT_PREFIX + secrets.token_hex(8)
+            folder = self.data_dir / "app" / "attachments"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{aid}.{fmt}"
+            path.write_bytes(data)
+            title = Path(name).stem[:MAX_TITLE_CHARS]
+            try:
+                clauses = att.parse_file(path, fmt, title, aid)
+            except InputError as e:
+                path.unlink(missing_ok=True)
+                raise ServiceError(422, "unreadable", e.message, "file") from None
+            except Exception as e:  # noqa: BLE001 — битый файл: понятная ошибка, а не 500
+                path.unlink(missing_ok=True)
+                log.warning("attach %s: ошибка чтения %s", aid, type(e).__name__)
+                raise ServiceError(422, "unreadable", ERR_ATT_UNREADABLE, "file") from None
+            if not clauses:
+                path.unlink(missing_ok=True)
+                raise ServiceError(422, "empty", ERR_ATT_EMPTY, "file")
+            doc = Document(id=aid, contract_id=None, group_id=chat.context.group_id, title=title, doc_type=dtype,
+                           source_path=f"app/attachments/{path.name}", original_format=fmt, sha256=sha,
+                           uploaded_by="chat", uploaded_at=dt.datetime.now(dt.UTC), status=DocStatus.ready)
+            body = {"id": aid, "chat_id": chat_id, "title": title, "filename": name, "format": fmt,
+                    "size": len(data), "clauses": len(clauses),
+                    "sections": [s[0] for s in att.sections(clauses)][:20],
+                    "uploaded_at": doc.uploaded_at.isoformat(), "added_to": None, "kit_doc_id": None,
+                    "document": _dump(doc)}
+            self.app.add_attachment(chat_id, aid, sha, body, clauses)
+        else:
+            aid = body["id"]
+            clauses = self.app.attachment_clauses(aid)
+            doc = Document.model_validate(body["document"])
+        if target_cid and body.get("added_to") != target_cid:
+            body = self._add_to_contract(chat, body, doc, clauses, target_cid, dtype)
+        self.app.set_active_attachment(chat_id, aid)
+
+        added = self._contract_label(body["added_to"]) if body.get("added_to") else None
+        answer = att.intro(doc, clauses, chat.context, added_to=added)
+        msg = Message(role="assistant", answer=answer, created_at=dt.datetime.now(dt.UTC))
+        with self._locked(req.id):
+            self.app.add_message(req.id, msg)
+            fresh = self.app.request(req.id)
+            if fresh.scenario is None:
+                fresh.scenario = answer.scenario
+                self.app.save_request(fresh)
+        log.info("attach chat=%s att=%s fmt=%s clauses=%d added=%s", chat_id, aid, fmt, len(clauses),
+                 body.get("added_to") or "-")
+        return {"attachment": {**body, "active": True}, "request_id": req.id, "message": _dump(msg)}
+
+    def _attach_target(self, chat: Any, contract_id: str | None) -> str | None:
+        """Договор, в документы которого добавить файл (настройка contract), или None — только в чате. Чат ГК —
+        договор выбирается в диалоге загрузки и обязан быть договором этой ГК (ADR 0005)."""
+        if self.settings()[SETTING_UPLOAD_TARGET] != "contract":
+            return None
+        allowed = self._chat_contracts(chat.id)
+        cid = chat.context.contract_id or contract_id
+        if not cid:
+            raise ServiceError(422, "required", ERR_ATT_CONTRACT, "contract_id")
+        if cid not in allowed:
+            raise ServiceError(422, "invalid", "Договор не относится к контексту этого чата.", "contract_id")
+        return cid
+
+    def _attach_request(self, chat_id: str, request_id: str | None, title: str) -> Any:
+        """Обращение для сообщения «Документ загружен»: открытое обращение этого чата или новое."""
+        from dms_core.constants import RequestStatus
+
+        if request_id:
+            req = self._request(request_id)
+            if req.chat_id != chat_id:
+                raise ServiceError(422, "invalid", "Обращение не относится к этому чату.", "request_id")
+            if req.status == RequestStatus.open:
+                return req
+        return self.app.create_request(chat_id, f"Документ «{title[:MAX_TITLE_CHARS - 12]}»")
+
+    def _contract_label(self, contract_id: str) -> str:
+        try:
+            c = self.kit.contract(contract_id)
+        except (KeyError, ValueError):
+            return contract_id
+        return f"№ {c.number}" if c.number else c.legal_entity
+
+    def _add_to_contract(self, chat: Any, body: dict, doc: Any, clauses: list, cid: str, dtype: Any) -> dict:
+        """Документ из чата → документ договора: свой id «<договор>.chat_<hex>», пункты того же текста, статус
+        «готов», предупреждение «загружен из чата» (повторный импорт стирает). Ревизия договора меняется —
+        поиск и кэш пунктов пересобираются; кэши перечня (onboarding.invalidate) — тоже."""
+        from dms_core import attachment as att
+        from dms_core import onboarding
+
+        levels = load_yaml("precedence.yaml")["levels"]
+        kit_id = f"{cid}.chat_{body['id'][len(ATT_PREFIX):]}"
+        kdoc = doc.model_copy(update={
+            "id": kit_id, "contract_id": cid, "group_id": self.kit.contract(cid).group_id, "doc_type": dtype,
+            "precedence_level": levels.get(dtype.value),
+            "warnings": [(f"Загружен из чата «{chat.title}». Повторный импорт комплекта (или повторная обработка "
+                          "договора клиента) удаляет этот документ — тогда загрузите его снова.")]})
+        try:
+            self.kit.add_documents(cid, [kdoc], att.rebind(clauses, kit_id, cid))
+        except KeyError:
+            raise ServiceError(422, "contract_not_loaded", "Договор чата не загружен: выполните импорт комплекта.") \
+                from None
+        except ValueError:
+            # документ уже был добавлен (повторная загрузка того же файла) — отмечаем и не дублируем
+            pass
+        onboarding.invalidate(cid)
+        body = {**body, "added_to": cid, "kit_doc_id": kit_id}
+        self.app.save_attachment(body["id"], body)
+        return body
 
     # ---------------------------------------------------------------- импорт комплекта (в фоне)
 
@@ -565,15 +940,20 @@ class Service:
         if "clients_root" in params:
             kw["clients_root"] = self.clients_root
 
+        target = self._import_target(kit)
+        if target is not None and "previous" in params:
+            kw["previous"] = kit   # прежняя база — договоры клиентов, которые нельзя разобрать заново (как CLI)
+
         def run() -> None:
             t0 = time.perf_counter()
             try:
-                report = ingest(root, kit, **kw)
+                report = self._ingest_atomic(ingest, root, kit, target, kw) if target is not None \
+                    else ingest(root, kit, **kw)
                 self.import_job = {"state": "done", "seconds": round(time.perf_counter() - t0, 1),
                                    "report": _safe_report(report)}
                 log.info("import-kit: готово за %.1f с", time.perf_counter() - t0)
             except Exception as e:  # noqa: BLE001 — сбой фоновой задачи виден в состоянии задачи
-                log.warning("import-kit: ошибка %s", type(e).__name__)
+                log.warning("import-kit: ошибка %s в %s", type(e).__name__, _where(e))
                 self.import_job = {"state": "error", "message": "Импорт не удался. Проверьте комплект и "
                                                                 "запустите скрипт импорта вручную."}
             finally:
@@ -582,6 +962,42 @@ class Service:
 
         threading.Thread(target=run, name="dms-import-kit", daemon=True).start()
         return dict(self.import_job)
+
+    def _import_target(self, kit: Any) -> Path | None:
+        """Файл базы, в который импорт собирается атомарно: база в файле — её путь; хранилище по умолчанию в памяти
+        (чистая установка) — data/derived/kit.sqlite. Хранилище в памяти, переданное явно (тесты), — None: импорт
+        пишет в него как раньше."""
+        from dms_core.store.db import default_path
+
+        path = getattr(kit, "path", None)
+        if path is not None and str(path) != ":memory:":
+            return Path(path)
+        return default_path() if self._kit is None and hasattr(kit, "replace_file") else None
+
+    def _ingest_atomic(self, ingest: Callable[..., dict], root: Path, kit: Any, target: Path,
+                       kw: dict[str, Any]) -> dict:
+        """Импорт, как в scripts/ingest_kit.py (ревью 29.10.2026 п. 1): сборка в <база>.tmp, затем атомарная замена
+        под блокировкой хранилища. Пока идёт сборка, ответы читают прежнюю базу целиком; сбой — прежняя база цела."""
+        from dms_core import onboarding
+        from dms_core.index import search
+        from dms_core.store.db import KitStore
+
+        tmp = target.with_name(target.name + ".tmp")
+        for p in (tmp, tmp.with_name(tmp.name + "-wal"), tmp.with_name(tmp.name + "-shm")):
+            p.unlink(missing_ok=True)
+        try:
+            with KitStore(tmp) as new:
+                report = ingest(root, new, **kw)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        old_ids = [c.id for c in kit.contracts()]
+        kit.replace_file(tmp, target)
+        # индексы и кэши движка — по договорам старой и новой базы (метки ревизий в новом файле могут совпасть)
+        search.invalidate()
+        for cid in set(old_ids) | {c.id for c in kit.contracts()}:
+            onboarding.invalidate(cid)
+        return report
 
     def import_status(self) -> dict:
         return dict(self.import_job)
@@ -1274,42 +1690,109 @@ class Service:
     # ---------------------------------------------------------------- вопрос → ответ
 
     def prepare_message(self, request_id: str, body: dict) -> tuple[Any, Any, str]:
-        """Проверки до тяжёлого расчёта (их ошибки уходят обычным JSON даже для потока SSE)."""
+        """Проверки до тяжёлого расчёта (их ошибки уходят обычным JSON даже для потока SSE). Обращение помечается
+        занятым до release_busy (её вызывает поток расчёта в конце): две вкладки или двойной клик не считают два ответа
+        одновременно — второй вопрос получает 409 request_busy (ревью 29.10.2026 п. 5)."""
         req = self._open_request(request_id)
         text = _text(body, "text", required=True, limit=MAX_QUESTION_CHARS, label="Вопрос")
         chat = self._chat(req.chat_id)
+        with self._req_locks_guard:
+            if req.id in self._busy:
+                raise ServiceError(409, "request_busy", ERR_BUSY)
+            self._busy.add(req.id)
         return req, chat, text
 
+    def clarify_of(self, body: dict) -> str | None:
+        """Вопрос из «Что уточнить», на который отвечает сообщение (необязательное поле clarify): не длиннее
+        CLARIFY_MAX_CHARS. Ответ склеивается с исходным вопросом (followup.clarify_reply)."""
+        from dms_core.followup import CLARIFY_MAX_CHARS
+
+        return _text(body, "clarify", required=False, limit=CLARIFY_MAX_CHARS, label="Уточнение") or None
+
+    def release_busy(self, request_id: str) -> None:
+        with self._req_locks_guard:
+            self._busy.discard(request_id)
+
     def answer_message(self, req: Any, chat: Any, text: str,
-                       on_stage: Callable[[str], None] | None = None) -> dict:
+                       on_stage: Callable[[str], None] | None = None, clarify: str | None = None) -> dict:
         """Синхронно (вызывается в потоке): сообщение пользователя → engine.answer → сообщение ассистента.
         Оба сообщения дописываются в базу здесь же: обрыв соединения не теряет ответ."""
-        from dms_core.constants import AnswerMode
         from dms_core.schemas import Message
 
         stage = on_stage or (lambda _s: None)
         now = dt.datetime.now(dt.UTC)
-        self.app.add_message(req.id, Message(role="user", text=text, created_at=now))
+        active = self.app.active_attachment(chat.id)
+        if active:
+            # активное вложение чата (ADR 0016): ответ только по его пунктам, мимо движка договора
+            return self._answer_attachment(req, chat, text, active, stage)
+        # под блокировкой запроса (w16-sec): выбор клиники (choose_clinic) дописывает сообщения под ней же и,
+        # увидев новый вопрос после своего ответа, отклоняется 409, а не пересчитывает устаревший ответ;
+        # закрытый за время ожидания слота запрос — 409, как в prepare_message
+        with self._locked(req.id):
+            self._open_request(req.id)
+            # короткий ответ на уточняющий вопрос ассистента продолжает исходный вопрос (followup.py, w16):
+            # «Стандарт» после «Какая программа?» → движку уходит исходный вопрос «… По программе «Стандарт».»
+            msgs = self.app.request(req.id).messages
+            if clarify:
+                # ответ на вопрос из «Что уточнить»: в ленте — «вопрос — ответ», движку — исходный вопрос с ответом
+                asked = clarify_reply(msgs, clarify, text)
+                text = f"{clarify.strip()} — {text.strip()}"
+            else:
+                asked = followup_question(msgs, text)
+            self.app.add_message(req.id, Message(role="user", text=text, asked=asked, created_at=now))
+        try:
+            return self._answer_after_question(req, chat, asked or text, stage)
+        except BaseException as e:
+            # вопрос уже в истории — без ответа он остался бы «висеть» и сбил бы выбор клиники и уточнения
+            # (их ищут по предыдущему вопросу); дописываем ответ-ошибку (ревью 29.10.2026 п. 4)
+            self._add_error_reply(req.id, e)
+            raise
+
+    def _add_error_reply(self, request_id: str, e: BaseException) -> None:
+        from dms_core.schemas import Message
+
+        text = e.message if isinstance(e, ServiceError) else ui_texts()["errors"]["internal"]
+        try:
+            with self._locked(request_id):
+                self.app.add_message(request_id, Message(role="assistant", text=text,
+                                                         created_at=dt.datetime.now(dt.UTC)))
+        except Exception as e2:  # noqa: BLE001 — запись ошибки не должна заслонять исходную
+            log.warning("answer: не удалось записать ответ-ошибку (%s)", type(e2).__name__)
+
+    def _answer_after_question(self, req: Any, chat: Any, question: str, stage: Callable[[str], None]) -> dict:
+        """Расчёт ответа на уже записанный вопрос и запись ответа (часть answer_message)."""
+        from dms_core.constants import AnswerMode
+        from dms_core.schemas import Message
+
         t0 = time.perf_counter()
         llm = None
         try:
             llm = self.get_llm()
         except Exception as e:  # noqa: BLE001 — неверная настройка провайдера: работаем без модели
             log.warning("llm: не создана (%s)", type(e).__name__)
-        answer = self.demo_saved(text, chat.context) if llm is None else None
+        answer = self.demo_saved(question, chat.context) if llm is None else None
         slots: dict[str, str] = {}
         if answer is None:
             # стадии сообщает сам движок (engine.answer on_stage): route, clarify, contract:cNN, verify:cNN, compose
             trace: dict = {}
-            answer = self._answer_safely(text, chat.context, llm, stage, trace)
+            answer = self._answer_safely(question, chat.context, llm, stage, trace)
             slots = {k: str(v) for k, v in (trace.get("slots") or {}).items() if v}
+            # факты о госпитализации со слов менеджера (guided.refusal_facts) — в факты обращения: карточка фактов
+            # в чате показывает их и даёт поправить одним кликом
+            from dms_core.guided import refusal_facts
+
+            facts = refusal_facts(question)
+            if facts["mode"]:
+                slots["fact_mode"] = facts["mode"]
+            if facts["referral"] is not None:
+                slots["fact_referral"] = "yes" if facts["referral"] else "no"
         else:
             stage("demo_saved")
         if answer.processing_ms is None:
             answer.processing_ms = int(1000 * (time.perf_counter() - t0))
         msg = Message(role="assistant", answer=answer, created_at=dt.datetime.now(dt.UTC))
-        self.app.add_message(req.id, msg)
         with self._locked(req.id):
+            self.app.add_message(req.id, msg)
             # перечитать под блокировкой: пока считался ответ, менеджер мог сделать шаг автомата или оценить запрос
             fresh = self.app.request(req.id)
             changed = False
@@ -1332,18 +1815,55 @@ class Service:
                  answer.processing_ms)
         return {"message": _dump(msg), "answer": _dump(answer)}
 
+    def _answer_attachment(self, req: Any, chat: Any, text: str, attachment_id: str,
+                           stage: Callable[[str], None]) -> dict:
+        """Вопрос по активному вложению: attachment.answer по пунктам вложения (цитаты проверены по тексту пункта),
+        без меток и без условий договора. Сообщения дописываются под блокировкой запроса, как у обычного ответа."""
+        from dms_core import attachment as att
+        from dms_core.schemas import Document, Message
+
+        t0 = time.perf_counter()
+        with self._locked(req.id):
+            self._open_request(req.id)
+            self.app.add_message(req.id, Message(role="user", text=text, created_at=dt.datetime.now(dt.UTC)))
+        stage("contracts")
+        body, clauses = self._own_attachment(attachment_id, chat.id)
+        answer = att.answer(text, Document.model_validate(body["document"]), clauses, chat.context)
+        stage("compose")
+        answer.processing_ms = int(1000 * (time.perf_counter() - t0))
+        msg = Message(role="assistant", answer=answer, created_at=dt.datetime.now(dt.UTC))
+        with self._locked(req.id):
+            self.app.add_message(req.id, msg)
+            fresh = self.app.request(req.id)
+            if fresh.scenario is None:
+                fresh.scenario = answer.scenario
+                self.app.save_request(fresh)
+        log.info("answer request=%s attachment=%s points=%d ms=%s", req.id, attachment_id,
+                 len(answer.reply.points) if answer.reply else 0, answer.processing_ms)
+        return {"message": _dump(msg), "answer": _dump(answer)}
+
     def _answer_safely(self, text: str, context: Any, llm: Any,
                        on_stage: Callable[[str], None] | None = None, trace: dict | None = None,
                        clinic_picks: dict[str, str] | None = None) -> Any:
         """engine.answer с моделью; сбой модели/агента → extractive (без модели) с понятной пометкой.
         clinic_picks — выбор клиники менеджером по договорам (ADR 0010), и в повторе без модели тоже."""
+        from dms_core.engine import contracts_of
         from dms_core.llm.base import LlmError
+        from dms_core.store.db import ContractNotLoaded
 
+        # договоры контекста — до расчёта: «не загружен» — только когда их правда нет (ревью 29.10.2026 п. 3);
+        # KeyError изнутри движка — ошибка кода: в журнал с местом, менеджеру — «внутренняя ошибка» (500)
+        try:
+            contracts_of(context, self.kit)
+        except KeyError:
+            raise ServiceError(422, "contract_not_loaded", ERR_NOT_LOADED) from None
         try:
             return self._engine_answer(text, context, llm, on_stage, trace, clinic_picks)
-        except KeyError:
-            raise ServiceError(422, "contract_not_loaded", "Договор контекста не загружен: выполните импорт "
-                                                           "комплекта и создайте чат заново.") from None
+        except ContractNotLoaded:   # договор удалили, пока считался ответ (импорт, подключение клиента)
+            raise ServiceError(422, "contract_not_loaded", ERR_NOT_LOADED) from None
+        except KeyError as e:
+            log.error("answer: KeyError в %s", _where(e))
+            raise
         except LlmError as e:
             failure: Exception = e
         except Exception as e:
@@ -1377,6 +1897,11 @@ class Service:
             if cid not in self._chat_contracts(req.chat_id):
                 raise ServiceError(422, "contract_not_in_context", t["error_contract"], "contract_id")
             idx, offer = _clinic_offer(req, cid, t)
+            if idx != len(req.messages) - 1:
+                # после ответа с выбором уже задан новый вопрос (или пришёл ответ на него): выбор относится к
+                # устаревшему ответу — не пересчитываем его поверх нового (w16-sec)
+                raise ServiceError(409, "clinic_choice_stale", t.get("error_stale") or ERR_STALE_CHOICE,
+                                   "contract_id")
             question = _pick_question(req, idx, t)
             row = None
             if choice != CLINIC_PICK_NONE:
@@ -1445,7 +1970,9 @@ class Service:
 
     def demo_saved(self, text: str, context: Any) -> Any:
         """Сохранённый ответ демо-примера (data/app/demo_saved/<id>.json, формируется на живой модели): только
-        если вопрос совпал с примером дословно (без регистра и знаков) и контекст чата — тот же договор/группа.
+        если вопрос совпал с примером дословно (без регистра и знаков) и контекст чата — тот же договор/группа,
+        та же программа и (если у примера задана дата) та же дата. Ссылки ответа перед показом проверяются
+        citations.verify по текущей базе (_reverify_saved): непроверенные выбрасываются (`docs/rules.md` п. 1).
         Иначе None — дальше extractive. Чужой контекст не подставляется (ADR 0005)."""
         from dms_core.constants import AnswerMode
         from dms_core.schemas import Answer
@@ -1457,6 +1984,12 @@ class Service:
             ectx = ex.get("context") or {}
             same = (ectx.get("contract_id") or None) == context.contract_id and (
                 context.contract_id or (ectx.get("group_id") or None) == context.group_id)
+            # программа — всегда (у программ разные условия); дата — если пример от неё зависит (взносы, сроки):
+            # пример без даты чат создаёт с сегодняшней (chat.js runExample), ответ от даты не зависит
+            same = bool(same) and (ectx.get("program") or None) == (context.program or None)
+            edate = ectx.get("date") or None
+            if same and edate is not None:
+                same = context.date is not None and str(edate) == context.date.isoformat()
             path = self.data_dir / "app" / "demo_saved" / f"{ex.get('id')}.json"
             if not same or not re.fullmatch(r"[A-Za-z0-9_\-]{1,40}", str(ex.get("id"))) or not path.is_file():
                 continue
@@ -1464,6 +1997,10 @@ class Service:
                 ans = Answer.model_validate_json(path.read_text(encoding="utf-8"))
             except (OSError, ValidationError):
                 log.warning("demo_saved %s: файл не читается", ex.get("id"))
+                return None
+            ans = self._reverify_saved(ans)
+            if ans is None:
+                log.warning("demo_saved %s: ссылки не подтвердились по текущей базе", ex.get("id"))
                 return None
             ans.mode = AnswerMode.demo_saved
             note = "Сохранённый ответ демо-примера (модель сейчас не подключена)."
@@ -1477,6 +2014,80 @@ class Service:
                     ans.reply = chat_reply(ans, question=text)
             return ans
         return None
+
+    def _reverify_saved(self, ans: Any) -> Any:
+        """Ссылки сохранённого ответа — заново через citations.verify по текущей базе (`docs/rules.md` п. 1): база могла
+        быть пересобрана после сохранения. Каждая ссылка проверяется в своём договоре (Citation.contract_id) как
+        утверждение с одной ссылкой; прогоном агента считается сам сохранённый ответ (run_refs — ссылки ответа),
+        вычислений инструментов нет (tools=[]): ссылка на договор без цитаты не подтверждается. Живая ссылка
+        берётся из verify (фрагмент текста документа), мёртвая выбрасывается; утверждение без живых ссылок
+        удаляется, пункты ответа в чате (reply.points) — только с живыми ссылками, альтернативы — только строки
+        перечня, которые есть в базе. Были утверждения, а живых не осталось, — None (показывать нечего)."""
+        from dms_core.citations import verify
+        from dms_core.schemas import DraftAnswer, DraftCitation, DraftStatement
+
+        groups = [ans.statements, ans.comparisons, *(pc.statements for pc in ans.per_contract)]
+        had = sum(len(g) for g in groups)
+        program = ans.context.program
+        pairs: dict[str, list[tuple[str, str, str]]] = {}      # договор → (текст утверждения, ref, цитата)
+        for g in groups:
+            for st in g:
+                for c in st.citations:
+                    if c.ref and c.contract_id:
+                        pairs.setdefault(c.contract_id, []).append((st.text, c.ref, c.quote))
+        alive: dict[tuple[str, str, str, str], Any] = {}         # (договор, текст, ref, цитата) → Citation из verify
+        for cid, items in pairs.items():
+            draft = DraftAnswer(contract_id=cid, summary="", statements=[
+                DraftStatement(text=t, citations=[DraftCitation(ref=r, quote=q)]) for t, r, q in items])
+            try:
+                v = verify(draft, {r for _t, r, _q in items}, self.kit, cid, program=program, tools=[])
+            except Exception as e:  # noqa: BLE001 — договора нет в базе: ни одна ссылка не подтверждена
+                log.warning("demo_saved: проверка ссылок договора не выполнена (%s)", type(e).__name__)
+                continue
+            # verify сохраняет порядок утверждений и удаляет мёртвые: сопоставление с исходными — проходом по порядку
+            out, k = v.draft.statements, 0
+            for t, r, q in items:
+                if k < len(out) and out[k].text == t and out[k].citations[0].ref == r:
+                    cit = v.citation(out[k].citations[0])
+                    if cit is not None:
+                        alive[(cid, t, r, q)] = cit
+                    k += 1
+
+        def keep(sts: list) -> list:
+            res = []
+            for st in sts:
+                cits = [alive[key] for c in st.citations
+                        if (key := (c.contract_id or "", st.text, c.ref or "", c.quote)) in alive]
+                if cits:
+                    res.append(st.model_copy(update={"citations": cits}))
+            return res
+
+        ans = ans.model_copy(deep=True)
+        ans.statements = keep(ans.statements)
+        ans.comparisons = keep(ans.comparisons)
+        for pc in ans.per_contract:
+            pc.statements = keep(pc.statements)
+        left = len(ans.statements) + len(ans.comparisons) + sum(len(pc.statements) for pc in ans.per_contract)
+        if had and not left:
+            return None
+        live_refs = {key[2] for key in alive}
+        if ans.reply is not None:
+            points = []
+            for p in ans.reply.points:
+                refs = [r for r in p.refs if r in live_refs]
+                if refs:
+                    points.append(p.model_copy(update={"refs": refs}))
+            ans.reply = ans.reply.model_copy(update={"points": points})
+        rows: dict[str, set[str]] = {}
+        for alt in ans.alternatives:
+            cid = alt.clinic.contract_id
+            if cid not in rows:
+                try:
+                    rows[cid] = {r.id for r in self.kit.clinics(cid)}
+                except Exception:  # noqa: BLE001 — договора нет в базе
+                    rows[cid] = set()
+        ans.alternatives = [a for a in ans.alternatives if a.clinic.id in rows.get(a.clinic.contract_id, set())]
+        return ans
 
     # ---------------------------------------------------------------- примеры
 
@@ -1575,6 +2186,77 @@ class Service:
             return self.app.draft(draft_id)
         except KeyError:
             raise _err_not_found("Черновик") from None
+
+    # ---------------------------------------------------------------- письмо из любого ответа
+
+    LETTER_BASIS_MAX = 4          # пунктов в «Основании» письма
+    LETTER_QUOTE_CHARS = 220      # знаков цитаты в письме
+
+    def letter(self, request_id: str, body: dict) -> dict:
+        """Письмо HR или в СК по ответу обращения (по умолчанию — последнему): шаблон config/texts_ru/drafts.yaml
+        letters, поля — из проверенного ответа (первая фраза, пункты с цитатами, что уточнить) и карточки договора.
+        Письмо не сохраняется и не отправляется: окно «Письмо» в чате — скопировать, скачать, открыть в почте."""
+        from dms_core.promises import find_promises
+        from dms_core.scenarios.drafts import render_letter
+        from dms_core.schemas import Answer
+
+        to = body.get("to")
+        if to not in ("hr", "insurer"):
+            raise ServiceError(422, "invalid", "Кому письмо: hr или insurer.", "to")
+        req = self._request(request_id)
+        answers = [m.answer for m in req.messages if m.answer is not None and not (m.answer.reply and m.answer.reply.service)]
+        idx = body.get("message")
+        if not answers:
+            raise ServiceError(409, "no_answer", "В обращении ещё нет ответа по документам.")
+        a: Answer = answers[-1] if idx is None or not isinstance(idx, int) or not (0 <= idx < len(answers)) else answers[idx]
+        template = "answer_hr" if to == "hr" else "answer_insurer"
+        r = a.reply
+        ctx = a.context
+        cids = [ctx.contract_id] if ctx.contract_id else list(dict.fromkeys(p.contract_id for p in a.per_contract))
+        cards = []
+        for cid in cids:
+            try:
+                cards.append(self.kit.contract(cid))
+            except (KeyError, ValueError):
+                continue
+        contract = ", ".join(f"№ {c.number}" if c.number else c.id for c in cards)
+        legal = ", ".join(dict.fromkeys(c.legal_entity for c in cards))
+        slots = req.slots or {}
+        topic = slots.get("service") or slots.get("care_type") or (req.title or "")[:80]
+        # основание: проверенные цитаты пунктов ответа (документ, пункт / строка таблицы, цитата)
+        cites = [c for st in [*a.statements, *(s for pc in a.per_contract for s in pc.statements)]
+                 for c in st.citations if c.verified]
+        basis: list[str] = []
+        for pt in (r.points if r else [])[: self.LETTER_BASIS_MAX]:
+            c = next((x for x in cites if x.ref and x.ref in pt.refs), None) or \
+                next((x for x in cites if pt.quote and pt.quote[:40] in x.quote), None)
+            if c is None:
+                continue
+            ref = _human_ref(c.table_ref)
+            where = f", п. {c.clause_number}" if c.clause_number else (f", {ref}" if ref else "")
+            # ячейки строки таблицы в цитате разделены « | » — в письме через тире
+            # сноски Word («томографию[^4]») в письме не нужны
+            quote = re.sub(r"\[\^\d+\]", "", c.quote.replace(" | ", " — "))
+            quote = quote if len(quote) <= self.LETTER_QUOTE_CHARS else quote[: self.LETTER_QUOTE_CHARS].rsplit(" ", 1)[0] + "…"
+            line = f"— {c.doc_title}{where}: «{quote}»"
+            if not find_promises(line, template):
+                basis.append(line)
+        asks = [q for q in (r.ask if r else []) if q.strip().endswith("?") and not find_promises(q, template)]
+        head = ui_texts()["letters"]["asks_head"]
+        fields = {"contract": contract, "legal_entity": legal, "program": f"«{ctx.program}»" if ctx.program else "",
+                  "topic": topic, "conclusion": _lead_sentence((r.lead if r else a.summary) or ""), "basis": "\n".join(dict.fromkeys(basis)),
+                  "asks": (head + "\n" + "\n".join("— " + q for q in dict.fromkeys(asks))) if asks else ""}
+        return render_letter(template, fields)
+
+    def check_letter(self, body: dict) -> dict:
+        """Письмо после правки менеджером: фильтр config/forbidden_promises.yaml и незаполненные «[ЗАПОЛНИТЬ]»."""
+        from dms_core.promises import find_promises
+        from dms_core.scenarios.drafts import FILL
+
+        subject = _text(body, "subject", required=False, limit=300, label="Тема") or ""
+        text = _text(body, "body", required=True, limit=20000, label="Текст письма") or ""
+        template = body.get("template") if body.get("template") in ("answer_hr", "answer_insurer") else "answer_hr"
+        return {"promises": find_promises(subject + "\n" + text, template), "unfilled": (subject + text).count(FILL)}
 
     def edit_draft(self, draft_id: str, body: dict) -> dict:
         """Правка черновика менеджером: запрос должен быть открыт (409); итоговый текст (тема + тело) проходит
@@ -1694,6 +2376,17 @@ def _short_title(question: str, limit: int = 60) -> str:
         return q
     cut = q[:limit].rsplit(" ", 1)[0]
     return cut.rstrip(",.;:—- ") + "…"
+
+
+ERR_BUSY = "Ассистент ещё отвечает на предыдущий вопрос этого обращения. Дождитесь ответа."
+ERR_NOT_LOADED = "Договор контекста не загружен: выполните импорт комплекта и создайте чат заново."
+
+def _where(e: BaseException) -> str:
+    """Файл и строка, где возникла ошибка, — без текста исключения (в нём могут быть данные документов, п. 4)."""
+    import traceback
+
+    tb = traceback.extract_tb(e.__traceback__)
+    return f"{Path(tb[-1].filename).name}:{tb[-1].lineno}" if tb else "?"
 
 
 def _safe_report(report: dict) -> dict:

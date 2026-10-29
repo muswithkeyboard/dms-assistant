@@ -215,6 +215,12 @@ def test_group_lead_and_captions():
     assert r.points[1].text == "Договор № 6: Б не найдено."
     for t in all_texts(r):
         assert not SERVICE_ID.search(t), t
+    # одна метка у всех, но пункт есть только у второго договора: фраза — из него и с его номером, а не «не найдено»
+    empty = PerContract(contract_id="c05", summary="", label=Label.insufficient, statements=[])
+    some = same.model_copy(update={"per_contract": [empty, pc("c06", Label.insufficient)]})
+    r = chat_reply(some)
+    assert r.lead.startswith("Недостаточно данных — по всем договорам группы (2). Договор № 6: "), r.lead
+    assert "не найдено подтверждённых условий" not in r.lead and len(r.lead) <= 300
 
 
 def test_reply_quote_cut_by_phrase():
@@ -270,3 +276,103 @@ def test_refs_are_citation_ref_of_verified():
     r = chat_reply(ans([Statement(text="Вид помощи «МРТ» входит.", citations=[c])], label=Label.allowed))
     assert r.points[0].refs == ["c01.program#t5r10"]
     assert cite_ref(cit("x", clause="4.1")) == "c01.program:4.1"
+
+
+def test_oms_question_gets_dms_only_caution():
+    r = chat_reply(ans([care_in()], label=Label.insufficient), question="Можно ли вырвать зуб по ОМС?")
+    assert "Об ОМС ассистент не отвечает" in r.caution
+    r = chat_reply(ans([care_in()], label=Label.insufficient), question="Можно ли вырвать зуб?")
+    assert "ОМС" not in r.caution
+
+
+def test_points_only_about_service_of_question():
+    """«Вырвать зуб» — пункты об удалении зубов, без чистки («удаление зубных отложений») и пломб (ревизия w18)."""
+    pull = st("Хирургическая стоматология: удаление зубов (простое, сложное).",
+              "Хирургическая стоматология: удаление зубов (простое, сложное).", ref="p1")
+    clean = st("Профилактика: удаление зубных отложений ультразвуком.",
+               "Профилактика: удаление зубных отложений ультразвуком.", ref="p2")
+    fill = st("Постановка пломбы при разрушении коронковой части зуба.",
+              "Постановка пломбы при разрушении коронковой части зуба.", ref="p3")
+    r = chat_reply(ans([pull, clean, fill], label=Label.conditional), question="можно ли вырвать зуб")
+    assert [p.text for p in r.points] == ["Хирургическая стоматология: удаление зубов (простое, сложное)."]
+    # ни одного пункта о самой услуге — показываются все (lead скажет, что прямого ответа нет)
+    r = chat_reply(ans([clean, fill], label=Label.insufficient), question="можно ли вырвать зуб")
+    assert len(r.points) == 2
+
+
+def test_vague_question_gets_narrowing_options():
+    r = chat_reply(ans([], label=None, scenario=Scenario.general), question="а зубы?")
+    assert "Входит ли удаление зуба?" in r.options and r.lead.startswith("Ответ зависит")
+    r = chat_reply(ans([care_in()], label=Label.allowed), question="Входит ли удаление зуба?")
+    assert r.options == []
+
+
+def test_lead_of_long_list_shows_part_about_service():
+    """Длинный пункт-перечень в lead — начало пункта и часть с услугой, а не обрезанное начало (ревизия w18)."""
+    from dms_core.compose import _around
+
+    q = ("Зубопротезирование и подготовка к нему (за исключением случаев, предусмотренных Программой), включая "
+         "перелечивание корневых каналов, удаление кист, удаление и депульпирование зубов и пр. подготовительные "
+         "работы; имплантация зубов.")
+    got = _around(q, ["удаление", "зуб"])
+    assert got.startswith("Зубопротезирование и подготовка к нему …") and "депульпирование зубов" in got
+    assert "(за исключением" not in got and len(got) <= 160
+    short = "Услуги, оказываемые в косметических целях: отбеливание зубов, реставрация зубных рядов."
+    assert _around(short * 3, ["косметический"]).startswith("Услуги, оказываемые в косметических целях")
+
+
+def test_key_lemmas_of_question():
+    """Ключевые слова услуги — существительные без общих слов процедуры, условий и названий (ревизия w18)."""
+    from dms_core.compose import _key_lemmas
+
+    assert _key_lemmas("Сотрудник хочет удалить родинку по косметическим показаниям, это покрыто?") == ["родинка"]
+    assert _key_lemmas("Можно ли к эндокринологу без направления терапевта?") == ["эндокринолог"]
+    assert _key_lemmas("Оплатят ли лечение ВИЧ-инфекции?") == ["вич", "инфекция"]
+    assert _key_lemmas("Покрывается ли МРТ коленного сустава?") == ["мрт"]          # анатомия — уточнение
+    assert _key_lemmas("Покрывается ли медикаментозное обеспечение?") == ["медикаментозный"]
+    assert _key_lemmas("Можно ли полечиться в клинике Мать и дитя?") == []          # название клиники — не услуга
+
+
+def test_main_point_must_name_the_service():
+    """Главный пункт — тот, где названа сама услуга; нет такого — lead так и говорит, без «ближайшего» о другом."""
+    cosm = st("Услуги в косметических целях: отбеливание зубов, реставрация зубных рядов.",
+              "Услуги в косметических целях: отбеливание зубов, реставрация зубных рядов.", ref="p9")
+    r = chat_reply(ans([cosm], label=Label.insufficient),
+                   question="Сотрудник хочет удалить родинку по косметическим показаниям, это покрыто?")
+    assert "прямо не названо: «родинка»" in r.lead and "отбеливание" not in r.lead
+    mole = st("Удаление доброкачественных новообразований кожи (родинок) по медицинским показаниям.",
+              "Удаление доброкачественных новообразований кожи (родинок) по медицинским показаниям.", ref="p8")
+    r = chat_reply(ans([cosm, mole], label=Label.insufficient),
+                   question="Сотрудник хочет удалить родинку по косметическим показаниям, это покрыто?")
+    assert "родинок" in r.lead
+
+
+def test_key_lemmas_program_names_and_question_words():
+    """Название программы — целым словом («МО» не режет «Можно»); «есть» — слово вопроса, не услуга (ревизия w18)."""
+    from dms_core.compose import _CONTEXT_NAMES, _key_lemmas
+
+    token = _CONTEXT_NAMES.set(("МО", "ВИП"))
+    try:
+        assert _key_lemmas("Можно ли к гинекологу в ВИП?") == ["гинеколог"]
+    finally:
+        _CONTEXT_NAMES.reset(token)
+    assert _key_lemmas("Есть ли франшиза?") == ["франшиза"]
+
+
+def test_synonyms_are_phrases_not_loose_words():
+    """«Зуб» из синонима «имплантация зуба» — не синоним «имплантации»; «МРТ» = «магнитно-резонансная томография»."""
+    from dms_core.compose import _phrase_hit, _synonyms
+    from dms_core.index.morph import lemmas
+
+    assert ("имплантация",) not in _synonyms("зуб")
+    have = set(lemmas("магнитно-резонансная томография головного мозга"))
+    assert any(_phrase_hit(p, have) for p in _synonyms("мрт"))
+
+
+def test_main_point_prefers_direct_row_and_full_clause():
+    """Равные пункты: строка таблицы «— да» и полный пункт главнее обрывка перечня (ревизия w18)."""
+    full = st("Диагностика и лечение сахарного диабета I и II типа (кроме осложнений сахарного диабета).",
+              "Диагностика и лечение сахарного диабета I и II типа (кроме осложнений сахарного диабета).", ref="p1")
+    frag = st("25. для лечения сахарного диабета;", "25. для лечения сахарного диабета;", ref="p2")
+    r = chat_reply(ans([frag, full], label=Label.conditional), question="Оплачивается ли лечение сахарного диабета?")
+    assert "I и II типа" in r.lead

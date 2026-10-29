@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+from array import array
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 
@@ -18,12 +19,18 @@ class BM25:
         self.n = len(docs)
         self.lengths = [len(d) for d in docs]
         self.avgdl = (sum(self.lengths) / self.n) if self.n else 0.0
-        postings: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        # постинги — два плотных массива на термин (номера документов, частоты): в 6–7 раз меньше памяти, чем
+        # список кортежей (круг 2 ревизии w16: индексы ГК из 100 договоров — ~640 тыс. пунктов)
+        ids: dict[str, array] = {}
+        tfs: dict[str, array] = {}
         for i, doc in enumerate(docs):
             for term, tf in Counter(doc).items():
-                postings[term].append((i, tf))
-        self.postings = dict(postings)
-        self.idf = {t: math.log(1.0 + (self.n - len(p) + 0.5) / (len(p) + 0.5)) for t, p in self.postings.items()}
+                if term not in ids:
+                    ids[term], tfs[term] = array("i"), array("i")
+                ids[term].append(i)
+                tfs[term].append(tf)
+        self.postings = {t: (ids[t], tfs[t]) for t in ids}
+        self.idf = {t: math.log(1.0 + (self.n - len(p[0]) + 0.5) / (len(p[0]) + 0.5)) for t, p in self.postings.items()}
 
     def scores(self, query: dict[str, float], allowed: set[int] | None = None) -> dict[int, float]:
         """Оценки документов, где встретился хотя бы один термин запроса. allowed — допустимые номера документов."""
@@ -33,7 +40,7 @@ class BM25:
             if not plist or weight <= 0:
                 continue
             idf = self.idf[term] * weight
-            for i, tf in plist:
+            for i, tf in zip(*plist, strict=True):
                 if allowed is not None and i not in allowed:
                     continue
                 norm = K1 * (1 - B + B * self.lengths[i] / self.avgdl) if self.avgdl else K1

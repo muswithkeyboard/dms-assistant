@@ -5,20 +5,28 @@
 """
 from __future__ import annotations
 
-from functools import cache
+import threading
 from typing import Any
 
 from ..schemas import CareMatrix, Clause, ClinicRow
 from ..store.db import KitStore, _require_contract_id
 
+_DEFAULT: KitStore | None = None
+_DEFAULT_LOCK = threading.Lock()
 
-@cache
+
 def default_store() -> KitStore:
     """data/derived/kit.sqlite — один объект на процесс. Базы нет — пустое хранилище в памяти: чтение по умолчанию
-    не создаёт файл (иначе пустая база в data/derived выдаёт себя за разобранный комплект; создаёт базу только импорт)."""
+    не создаёт файл (иначе пустая база в data/derived выдаёт себя за разобранный комплект; создаёт базу только импорт).
+    Хранилище в памяти не запоминается навсегда (ревью 29.10.2026 п. 1): появилась база (импорт скриптом) — следующий
+    вызов открывает её; импорт из интерфейса переводит тот же объект в файл сам (KitStore.replace_file)."""
     from ..store.db import default_path
 
-    return KitStore() if default_path().exists() else KitStore(":memory:")
+    global _DEFAULT
+    with _DEFAULT_LOCK:
+        if _DEFAULT is None or (str(_DEFAULT.path) == ":memory:" and default_path().exists()):
+            _DEFAULT = KitStore() if default_path().exists() else KitStore(":memory:")
+        return _DEFAULT
 
 
 def resolve(contract_id: str, store: KitStore | None) -> tuple[str, KitStore]:

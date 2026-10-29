@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ t.settings.title }} · {{ t.app_name }}{% endblock %}
+{% block scripts %}
+  <script src="/static/common.js?v={{ v }}" defer></script>
+  <script src="/static/settings.js?v={{ v }}" defer></script>
+{% endblock %}
+{% block main %}
+<h1 class="page-title">{{ t.settings.title }}</h1>
+<section class="panel settings">
+  <p class="hint">{{ t.settings.intro }}</p>
+  <form id="settings-form" novalidate>
+    <fieldset class="settings__group" id="upload-target" disabled>
+      <legend>{{ t.settings.upload_legend }}</legend>
+      <label class="settings__opt">
+        <input type="radio" name="chat_upload_target" value="chat">
+        <span><strong>{{ t.settings.upload_chat }}</strong><span class="hint settings__hint">{{ t.settings.upload_chat_hint }}</span></span>
+      </label>
+      <label class="settings__opt">
+        <input type="radio" name="chat_upload_target" value="contract">
+        <span><strong>{{ t.settings.upload_contract }}</strong><span class="hint settings__hint">{{ t.settings.upload_contract_hint }}</span></span>
+      </label>
+    </fieldset>
+    <p class="hint" id="settings-status" role="status" aria-live="polite"></p>
+    <p class="alert" id="settings-alert" role="alert" hidden></p>
+    <button class="btn btn--primary" type="submit" id="settings-save" disabled>{{ t.common.save }}</button>
+  </form>
+</section>
+{% endblock %}

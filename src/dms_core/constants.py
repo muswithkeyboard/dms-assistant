@@ -1,6 +1,7 @@
 """Перечисления контрактов (docs/CONTRACTS.md, план §5). Значения — строки, они же уходят в JSON и в конфиги."""
 from __future__ import annotations
 
+import os
 from enum import StrEnum
 
 ENGINE_VERSION = "0.1.0"
@@ -123,4 +124,11 @@ MATRIX_SAMPLE_ROWS = 20
 
 # Ответ в чате (ADR 0014)
 REPLY_POINTS_MAX = 6
+# Кэш пунктов и поисковых индексов договоров в памяти (store.KitStore.clauses, index.search.get_index): предел по
+# числу пунктов, сверх него вытесняются давно не нужные договоры (круг 2 ревизии w16; комплект — ~60 тыс. пунктов,
+# ~260 МБ с индексами; сервер — 2–4 ГБ). 0 — без кэша. Окружение DMS_CLAUSE_CACHE_MAX — для сервера с запасом
+# памяти (ГК из 100 договоров, ~640 тыс. пунктов: ~1,2 ГБ и 2–4 с на ответ вместо ~0,5 ГБ и ~20 с).
+_cache_env = (os.environ.get("DMS_CLAUSE_CACHE_MAX") or "").strip().replace("_", "")
+CLAUSE_CACHE_MAX = int(_cache_env) if _cache_env.isdigit() else 200_000   # опечатка — значение по умолчанию
+CLARIFY_OPTIONS_MAX = 24        # вариантов ответа кнопками на уточняющий вопрос (программы; ГК 1 — 16), больше — без кнопок
 REPLY_QUOTE_CHARS = 220

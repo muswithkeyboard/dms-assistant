@@ -103,6 +103,46 @@ def render(template_id: str, fields: dict[str, str], *, stage: AddClinicState,
     )
 
 
+def letters() -> dict[str, dict[str, Any]]:
+    """Шаблоны писем из ответа (config/texts_ru/drafts.yaml letters) — отдельно от шаблонов автомата."""
+    return dict((load_yaml("texts_ru/drafts.yaml") or {}).get("letters") or {})
+
+
+def letter_fields(template_id: str) -> list[str]:
+    tpl = letters()[template_id]
+    return list(dict.fromkeys(_FIELD_RE.findall(str(tpl.get("subject", "")) + "\n" + str(tpl.get("body", "")))))
+
+
+def render_letter(template_id: str, fields: dict[str, str]) -> dict[str, Any]:
+    """Письмо из ответа (шаблоны answer_hr / answer_insurer): не черновик автомата (Draft привязан к его шагам), а
+    текст для окна «Письмо» — тема, тело, незаполненные поля. Подстановка — как у render: значение с обещанием
+    (config/forbidden_promises.yaml) не подставляется; поля из «optional» могут быть пустыми — их строка убирается."""
+    tpl = letters()[template_id]
+    optional = set(tpl.get("optional") or [])
+    used: dict[str, str] = {}
+    unknown: list[str] = []
+    for name in letter_fields(template_id):
+        value = _clean(fields.get(name))
+        if value and not find_promises(value, template_id):
+            used[name] = value
+        elif not value and name in optional:
+            used[name] = ""
+        else:
+            unknown.append(name)
+            used[name] = FILL
+
+    def fill(text: str) -> str:
+        return _FIELD_RE.sub(lambda m: used.get(m.group(1), FILL), text)
+
+    subject = " ".join(fill(str(tpl.get("subject", ""))).split())
+    body = re.sub(r"\n{3,}", "\n\n", fill(str(tpl.get("body", ""))).strip()) + "\n"
+    hits = find_promises(subject + "\n" + body, template_id)
+    if hits:
+        raise ValueError(f"шаблон «{template_id}» содержит запрещённое обещание: {hits}")
+    return {"template": template_id, "to": str(tpl.get("to", "hr")), "subject": subject, "body": body,
+            "unknown_fields": unknown}
+
+
 def format_alternatives(alts: list[Alternative]) -> str:
     """Список клиник для письма HR: название, адрес и франшиза — только поля строки перечня (без источников)."""
     lines = []

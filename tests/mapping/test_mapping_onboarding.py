@@ -148,7 +148,7 @@ def test_force_generic_and_mapping_ignored_for_known_insurer():
 def test_migration_keeps_registry_and_mapping_roundtrip():
     tmp = ck.workdir()
     reg = ck.registry(tmp)
-    assert reg.migrate() == 5
+    assert reg.migrate() == 6          # 6: вложения чата и настройки (ADR 0016)
     ref = tm.TableRef(doc_id="u01.clinics", kind="xlsx_sheet", sheet="Лист 1")
     reg.save_table_mapping("u01", ref, MAPPING)
     reg.save_table_mapping("u01", ref, MAPPING.model_copy(update={"program": "Другая"}))
