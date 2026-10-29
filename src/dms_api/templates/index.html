@@ -11,6 +11,8 @@
      (или включён показ закрытых). На узком экране колонка выезжает слева по кнопке «Чаты». #}
   <aside class="panel side" id="side" aria-label="{{ t.chat.chats_title }}" tabindex="-1">
     <button class="btn btn--primary side__new" type="button" id="new-chat-btn" aria-haspopup="dialog">+ {{ t.chat.new_chat }}</button>
+    {# «О прототипе» — мигающая кнопка-ссылка: что умеет ассистент (пульс выключен при «уменьшить движение»). #}
+    <a class="side__about" href="/about"><span class="side__about-dot" aria-hidden="true"></span>{{ t.nav.about }}</a>
     <h2 class="side__h" id="chats-h">{{ t.chat.chats_title }}</h2>
     <ul class="navlist navlist--compact" id="chat-list" aria-labelledby="chats-h" aria-busy="true"></ul>
     <section class="side__req" id="req-box" aria-labelledby="req-h" hidden>

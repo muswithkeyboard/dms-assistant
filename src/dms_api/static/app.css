@@ -1160,3 +1160,36 @@ body::before { content: ""; position: fixed; inset: -15%; z-index: -1; pointer-e
 .facts__form-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .facts__form-row .clar__own { flex: 1 1 240px; max-width: 420px; }
 .dlg--letter { width: min(760px, calc(100vw - 32px)); } .dlg--letter textarea { width: 100%; font: inherit; font-size: .93rem; line-height: 1.5; }
+
+/* ---------- ровность текста (30.10.2026): одна высота полей, текст по центру, подписи вровень ---------- */
+/* Однострочные поля — ровно 44px, текст по центру (поле даты в Chrome иначе выше соседних на 11px). */
+input[type="text"], input[type="date"], input[type="search"], select { height: 44px; padding-block: 0; line-height: 1.3; }
+/* Поле вопроса: одна строка — по центру высоты 48px (было на 3px выше центра). */
+.chatlay .ask__row textarea { padding-block: 12px; }
+/* «Свой ответ» в «Что уточнить»: поле и кнопка одной высоты. */
+.clar__own .clar__input, .clar__own .btn { height: 38px; min-height: 38px; padding-block: 0; }
+/* Поля в два столбца с подписями разной длины: поля стоят вровень по нижнему краю. */
+.f2 > .f { align-content: end; }
+/* Дерево документов: свой маркер фиксированной ширины — подпись договора ровно под названием. */
+.tree summary { list-style: none; }
+.tree summary::-webkit-details-marker { display: none; }
+.tree summary::before { content: "▸"; display: inline-block; width: 16px; color: var(--text-2); }
+.tree details[open] > summary::before { content: "▾"; }
+.tree__branch > summary { display: block; }
+.tree__branch > summary .navlist__sub { padding-left: 16px; }
+/* Кнопки под ответом — одного размера. */
+.reply__morebar .btn { font-size: .87rem; min-height: 30px; padding-left: 0; padding-right: 0; }
+/* Шапка: «Justmedit» и «Ассистент ДМС» на одной линии текста. */
+.brand { align-items: baseline; }
+.brand__sep { align-self: center; }
+
+/* ---------- «О прототипе» в левой колонке: мигающая кнопка ---------- */
+.side__about { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 12px;
+  border: 1px solid var(--primary); border-radius: var(--radius-control); color: var(--primary-text); background: var(--primary-soft);
+  font-weight: 500; text-decoration: none; animation: dms-about 2.4s ease-in-out infinite; }
+.side__about:hover { background: var(--primary-tint); color: var(--primary-text-hover); }
+.side__about:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.side__about-dot { width: 8px; height: 8px; border-radius: var(--radius-dot); background: var(--icon-accent); flex: none;
+  animation: dms-blink 1.2s ease-in-out infinite; }
+@keyframes dms-about { 0%, 100% { box-shadow: 0 0 0 0 var(--glow); } 50% { box-shadow: 0 0 0 6px transparent; } }
+@keyframes dms-blink { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
