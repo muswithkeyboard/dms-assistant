@@ -1,0 +1,15 @@
+# Caddy: сертификат Let's Encrypt для DMS_DOMAIN выпускается и продлевается сам (нужны открытые 80 и 443); почта ACME не нужна.
+{$DMS_DOMAIN} {
+	encode zstd gzip
+	# загрузка документов договора — до 50 МБ
+	request_body {
+		max_size 50MB
+	}
+	reverse_proxy app:8080 {
+		# ответ на вопрос идёт потоком (стадии «Ищу пункты…») — без буферизации
+		flush_interval -1
+		transport http {
+			read_timeout 300s
+		}
+	}
+}

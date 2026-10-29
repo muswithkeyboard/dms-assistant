@@ -48,6 +48,8 @@ docker compose up --build
 (или `DMS_MODELS_DIR`). Лимит памяти контейнера по умолчанию 2 ГБ (`DMS_MEM_LIMIT`) — нижняя граница целевого
 сервера (ADR 0009). База разбора в Docker пустая (том `dms-derived`): выполните импорт (ниже).
 
+Выкладка на сервер с доменом и HTTPS (Caddy, одна команда) — `deploy/README.md`.
+
 ## Запуск без Docker
 
 ```bash

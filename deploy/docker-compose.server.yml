@@ -1,0 +1,55 @@
+# Выкладка на сервер: ассистент + Caddy (HTTPS от Let's Encrypt). Запуск — deploy/install.sh, описание — deploy/README.md.
+# Наружу открыты только 80 и 443 у Caddy; сервис слушает 8080 внутри сети docker и доверяет заголовкам только Caddy.
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  app:
+    build: {context: .., target: app}
+    image: dms-assistant:server
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DMS_HOST: 0.0.0.0
+      DMS_DATA_DIR: /data
+      DMS_ENGINE_MODE: "${DMS_ENGINE_MODE:-guided}"       # ответ строит код по документам; модель не нужна
+      DMS_ALLOWED_HOSTS: "${DMS_DOMAIN:?укажите DMS_DOMAIN в deploy/.env}"
+      DMS_TRUSTED_PROXIES: 172.30.0.10                    # Caddy (адрес ниже)
+      DMS_HTTPS: "1"
+    volumes:
+      - "${DMS_DATA_HOME:-../data}/raw:/data/raw:ro"
+      - "${DMS_DATA_HOME:-../data}/models:/data/models:ro"
+      - dms-derived:/data/derived
+      - dms-app:/data/app
+    networks: {dms: {ipv4_address: 172.30.0.20}}
+    <<: *hardening
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    mem_limit: "${DMS_MEM_LIMIT:-2g}"
+    pids_limit: 256
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10.2
+    depends_on: [app]
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DMS_DOMAIN: "${DMS_DOMAIN}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: {dms: {ipv4_address: 172.30.0.10}}
+    restart: unless-stopped
+
+networks:
+  dms:
+    ipam: {config: [{subnet: 172.30.0.0/24}]}
+
+volumes:
+  dms-derived:
+  dms-app:
+  caddy-data:
+  caddy-config:

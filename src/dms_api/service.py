@@ -2221,6 +2221,9 @@ class Service:
                 continue
         contract = ", ".join(f"№ {c.number}" if c.number else c.id for c in cards)
         legal = ", ".join(dict.fromkeys(c.legal_entity for c in cards))
+        # программа: из контекста чата; не выбрана, но в договоре она одна — она и есть
+        progs = {p.name for c in cards for p in c.programs}
+        program = ctx.program or (next(iter(progs)) if len(cards) == 1 and len(progs) == 1 else "")
         slots = req.slots or {}
         topic = slots.get("service") or slots.get("care_type") or (req.title or "")[:80]
         # основание: проверенные цитаты пунктов ответа (документ, пункт / строка таблицы, цитата)
@@ -2243,7 +2246,7 @@ class Service:
                 basis.append(line)
         asks = [q for q in (r.ask if r else []) if q.strip().endswith("?") and not find_promises(q, template)]
         head = ui_texts()["letters"]["asks_head"]
-        fields = {"contract": contract, "legal_entity": legal, "program": f"«{ctx.program}»" if ctx.program else "",
+        fields = {"contract": contract, "legal_entity": legal, "program": f"«{program}»" if program else "",
                   "topic": topic, "conclusion": _lead_sentence((r.lead if r else a.summary) or ""), "basis": "\n".join(dict.fromkeys(basis)),
                   "asks": (head + "\n" + "\n".join("— " + q for q in dict.fromkeys(asks))) if asks else ""}
         return render_letter(template, fields)
