@@ -24,7 +24,7 @@ services:
       - "${DMS_DATA_HOME:-../data}/models:/data/models:ro"
       - dms-derived:/data/derived
       - dms-app:/data/app
-    networks: {dms: {ipv4_address: 172.30.0.20}}
+    networks: [dms]                                       # адрес любой; фиксирован только у Caddy
     <<: *hardening
     tmpfs: ["/tmp:size=256m,mode=1777"]
     mem_limit: "${DMS_MEM_LIMIT:-2g}"

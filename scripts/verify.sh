@@ -54,8 +54,8 @@ else record FAIL "конфиги" "$(tail -1 "$TMP/cfg.log")"; fi
 # 3. Гигиена репозитория (`docs/rules.md` п. 3–4)
 echo "-- 3. Репозиторий"
 if git -C "$ROOT" rev-parse --git-dir > /dev/null 2>&1; then
-  BAD="$(git -C "$ROOT" ls-files | grep -E '^(data|reference)(/|$)|(^|/)\.env$|\.(docx|xlsx|pdf|zip)$' | grep -v '^tests/fixtures/' | head -5)"
-  if [ -z "$BAD" ]; then record PASS "git без данных" "нет data/, reference/, .env и документов вне tests/fixtures"
+  BAD="$(git -C "$ROOT" ls-files | grep -E '^(data|reference)(/|$)|(^|/)\.env$|\.(docx|xlsx|pdf|zip)$' | grep -v -E '^(tests/fixtures|kit)/' | head -5)"
+  if [ -z "$BAD" ]; then record PASS "git без данных" "нет data/, reference/, .env и документов вне tests/fixtures и kit/ (ADR 0020)"
   else record FAIL "git без данных" "в индексе: $BAD"; fi
 else
   record SKIP "git без данных" "не git-репозиторий (архив)"
